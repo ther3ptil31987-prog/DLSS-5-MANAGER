@@ -1,4 +1,4 @@
-namespace DLSS_5_MANAGER.Services
+﻿namespace DLSS_5_MANAGER.Services
 
 open System
 open System.Net.Http
@@ -10,7 +10,7 @@ open System.Text.RegularExpressions
 module UpdateChecker =
 
     [<Literal>]
-    let CurrentVersion = "1.2.6"
+    let CurrentVersion = "1.3.3"
 
     [<Literal>]
     let ReleasesApiUrl = "https://api.github.com/repos/NODIX-TECH/DLSS-5-MANAGER/releases"

@@ -508,50 +508,279 @@ module GameAnalyzer =
             StringComparer.OrdinalIgnoreCase
         )
 
-    /// "dx12" / "dx11" / "dx10" / "dx9", or "" when nothing gives it away.
-    /// Looks beside the executable and one level down, which is where the
-    /// Agility SDK keeps D3D12Core.dll.
-    let detectGraphicsApi (exePath: string) : string =
+    // =====================================================================
+    // WHAT THE GAME CAN RENDER WITH
+    // =====================================================================
+    //
+    // Shipped DLLs alone could never answer this. d3d12.dll and vulkan-1.dll
+    // are *system* libraries, so a title that renders with either normally
+    // ships neither - Red Dead Redemption 2 offers both DirectX 12 and Vulkan
+    // and carries no file for the latter anywhere in its folder. Judging by
+    // what happens to be lying around is why the old answer was so often wrong.
+    //
+    // So the executable is read instead. Every renderer a game can reach is
+    // named inside it: in the import table when it links the library directly,
+    // and as a plain string when it loads it at runtime - which is exactly how
+    // a game that offers the player a *choice* of two has to do it. Both live
+    // in the data sections, so the code section is skipped; that is most of the
+    // file. The read is capped and the answer is remembered, so opening a sheet
+    // never waits on this twice.
+
+    /// How much of one executable is worth reading. Names and string literals
+    /// sit in the data sections, and 24 MB of those is far more than any game
+    /// has - the cap only matters so a pathological file cannot stall the sheet.
+    [<Literal>]
+    let private ScanCap = 48 * 1024 * 1024
+
+    /// The sections that hold strings and imports. `.text` is deliberately
+    /// absent: it is the bulk of the file and holds no names.
+    let private dataSectionNames =
+        HashSet<string>([ ".rdata"; ".idata"; ".data" ], StringComparer.OrdinalIgnoreCase)
+
+    /// The data sections of a PE image, concatenated, capped at `ScanCap`.
+    let private peDataBytes (path: string) : byte[] =
         try
-            if String.IsNullOrWhiteSpace(exePath) then
-                ""
+            use stream = File.OpenRead(path)
+            use reader = new BinaryReader(stream)
+
+            if stream.Length < 0x40L || reader.ReadUInt16() <> 0x5A4Dus then
+                [||]
             else
-                let exeDir = Path.GetDirectoryName(exePath)
+                stream.Position <- 0x3CL
+                let peOffset = int64 (reader.ReadInt32())
 
-                if String.IsNullOrWhiteSpace(exeDir) || not (Directory.Exists(exeDir)) then
-                    ""
+                if peOffset <= 0L || peOffset + 24L > stream.Length then
+                    [||]
                 else
-                    let dirs =
-                        [ yield exeDir
-                          yield!
-                              (try
-                                  Directory.GetDirectories(exeDir)
-                                  |> Array.filter (fun d -> not (modOwnedDirs.Contains(Path.GetFileName(d))))
-                                  |> Array.toList
-                               with _ ->
-                                   []) ]
+                    stream.Position <- peOffset
 
-                    let present = HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                    if reader.ReadUInt32() <> 0x00004550u then // "PE\0\0"
+                        [||]
+                    else
+                        reader.ReadUInt16() |> ignore // machine
+                        let sectionCount = int (reader.ReadUInt16())
+                        reader.ReadUInt32() |> ignore // timestamp
+                        reader.ReadUInt32() |> ignore // symbol table
+                        reader.ReadUInt32() |> ignore // symbol count
+                        let optionalSize = int (reader.ReadUInt16())
+                        reader.ReadUInt16() |> ignore // characteristics
 
-                    for dir in dirs do
-                        try
-                            for file in Directory.GetFiles(dir, "*.dll") do
-                                let name = Path.GetFileName(file)
+                        // The section table follows the optional header.
+                        stream.Position <- stream.Position + int64 optionalSize
 
-                                // Only marker files matter, and only the handful
-                                // a wrapper could be squatting on need checking.
-                                if apiMarkerNames.Contains(name)
-                                   && (not (wrapperProneNames.Contains(name)) || not (isModWrapper file)) then
-                                    present.Add(name) |> ignore
-                        with _ ->
-                            ()
+                        let headers =
+                            [ for _ in 1 .. min sectionCount 96 do
+                                  let name =
+                                      Text.Encoding.ASCII.GetString(reader.ReadBytes(8)).TrimEnd('\000', ' ')
 
-                    apiMarkers
-                    |> List.tryFind (fun (_, markers) -> markers |> Array.exists present.Contains)
-                    |> Option.map fst
-                    |> Option.defaultValue ""
+                                  reader.ReadUInt32() |> ignore // virtual size
+                                  reader.ReadUInt32() |> ignore // virtual address
+                                  let rawSize = int (reader.ReadUInt32())
+                                  let rawPtr = int64 (reader.ReadUInt32())
+                                  reader.ReadBytes(16) |> ignore // relocations, line numbers, flags
+                                  yield (name, rawSize, rawPtr) ]
+
+                        let chunks = ResizeArray<byte[]>()
+                        let mutable taken = 0
+
+                        for (name, rawSize, rawPtr) in headers do
+                            if dataSectionNames.Contains(name)
+                               && rawSize > 0
+                               && rawPtr > 0L
+                               && rawPtr + int64 rawSize <= stream.Length
+                               && taken < ScanCap then
+                                let size = min rawSize (ScanCap - taken)
+                                stream.Position <- rawPtr
+                                chunks.Add(reader.ReadBytes(size))
+                                taken <- taken + size
+
+                        if chunks.Count = 0 then [||] else Array.concat chunks
         with _ ->
-            ""
+            [||]
+
+    /// One sweep over the bytes that answers for every renderer at once.
+    ///
+    /// Searching for each name separately meant a full pass per name, and that
+    /// is what made opening a large title take two seconds. Here the names are
+    /// filed by their first letter, so each byte costs one array lookup and,
+    /// almost always, nothing else - and the sweep stops early once every
+    /// renderer has been accounted for.
+    ///
+    /// Case-insensitive, and straight over the bytes: turning 48 MB into a
+    /// string first would cost twice that in memory to look for a few short
+    /// names.
+    let private scanFor (haystack: byte[]) (signatures: (string * string[]) list) =
+        let found = HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        let inline fold (b: byte) = if b >= 65uy && b <= 90uy then b + 32uy else b
+
+        // Every pattern, filed under the byte it starts with.
+        let buckets: (string * byte[]) list[] = Array.create 256 []
+
+        for (api, needles) in signatures do
+            for n in needles do
+                if n.Length > 0 then
+                    let pat = Array.init n.Length (fun i -> fold (byte n.[i]))
+                    let head = int pat.[0]
+                    buckets.[head] <- (api, pat) :: buckets.[head]
+
+        let apiCount = signatures |> List.length
+        let mutable i = 0
+
+        while i < haystack.Length && found.Count < apiCount do
+            match buckets.[int (fold haystack.[i])] with
+            | [] -> ()
+            | candidates ->
+                for (api, pat) in candidates do
+                    if not (found.Contains(api)) && i + pat.Length <= haystack.Length then
+                        let mutable k = 1
+
+                        while k < pat.Length && fold haystack.[i + k] = pat.[k] do
+                            k <- k + 1
+
+                        if k = pat.Length then found.Add(api) |> ignore
+
+            i <- i + 1
+
+        found
+
+    /// Renderer libraries a game ships under its own name, one per backend.
+    ///
+    /// Source 2 is why this exists: Counter-Strike 2's executable names no
+    /// graphics API at all, and the only thing that says what it can render
+    /// with is which of these sit beside it.
+    let private rendererDlls =
+        [ "rendersystemvulkan.dll", "vulkan"
+          "rendersystemdx11.dll", "dx11"
+          "rendersystemdx9.dll", "dx9"
+          "vulkan-1.dll", "vulkan"
+          "d3d12core.dll", "dx12"
+          "amd_fidelityfx_vk.dll", "vulkan"
+          "dxvk.dll", "vulkan" ]
+
+    /// What each renderer is called inside an executable. Kept short and
+    /// distinctive: these are matched against megabytes, so a loose word would
+    /// find itself somewhere by accident.
+    let private apiSignatures =
+        [ "dx12", [| "d3d12.dll"; "D3D12Core.dll"; "D3D12CreateDevice" |]
+          "dx11", [| "d3d11.dll"; "D3D11CreateDevice" |]
+          "dx10", [| "d3d10.dll"; "d3d10_1.dll" |]
+          "dx9", [| "d3d9.dll"; "Direct3DCreate9" |]
+          // vkCreateInstance and the swapchain extension are named by every
+          // Vulkan renderer, and by nothing else.
+          "vulkan", [| "vulkan-1.dll"; "vkCreateInstance"; "VK_KHR_swapchain" |]
+          "opengl", [| "opengl32.dll"; "wglCreateContext" |] ]
+
+    /// The answer for one executable, remembered against its identity. Opening
+    /// the same sheet again, or the second detection pass after the deep scan
+    /// settles the path, costs nothing.
+    let private apiMemo =
+        Collections.Concurrent.ConcurrentDictionary<string, string[]>(StringComparer.OrdinalIgnoreCase)
+
+    let private memoKey (exePath: string) =
+        try
+            let info = FileInfo(exePath)
+            sprintf "%s|%d|%d" exePath info.Length info.LastWriteTimeUtc.Ticks
+        with _ ->
+            exePath
+
+    /// Every API the title can render with, most decisive first.
+    ///
+    /// The DirectX generations collapse to the newest one present - a DX12 game
+    /// still carries DX11 names for its tooling - and Vulkan or OpenGL are
+    /// listed beside it, which is how a title that offers both ends up saying
+    /// so. Empty when the file gives nothing away.
+    let detectGraphicsApis (exePath: string) : string[] =
+        if String.IsNullOrWhiteSpace(exePath) || not (File.Exists(exePath)) then
+            [||]
+        else
+            apiMemo.GetOrAdd(
+                memoKey exePath,
+                fun _ ->
+                    try
+                        let found = HashSet<string>(StringComparer.OrdinalIgnoreCase)
+
+                        // 1. What the executable itself names.
+                        let bytes = peDataBytes exePath
+
+                        if bytes.Length > 0 then
+                            for api in scanFor bytes apiSignatures do
+                                found.Add(api) |> ignore
+
+                        // 2. What it ships beside it. Still worth reading: the
+                        //    Agility SDK's D3D12Core.dll sits in a subfolder and
+                        //    settles DX12 outright. Anything the mod itself put
+                        //    there is ignored, exactly as before.
+                        let exeDir = Path.GetDirectoryName(exePath)
+
+                        if not (String.IsNullOrWhiteSpace(exeDir)) && Directory.Exists(exeDir) then
+                            // Two levels down, not one. An engine can keep its
+                            // DirectX 12 runtime in a folder of its own beside
+                            // the executable - THE FINALS puts D3D12Core.dll in
+                            // D3D12\x64\ - and one level never reached it. Only
+                            // filenames are read, and the fan-out is capped, so
+                            // this stays cheap on a game folder of any size.
+                            let childrenOf (dir: string) =
+                                try
+                                    Directory.GetDirectories(dir)
+                                    |> Array.filter (fun d -> not (modOwnedDirs.Contains(Path.GetFileName(d))))
+                                    |> Array.truncate 40
+                                    |> Array.toList
+                                with _ ->
+                                    []
+
+                            let firstLevel = childrenOf exeDir
+                            let secondLevel = firstLevel |> List.collect childrenOf
+                            let dirs = List.concat [ [ exeDir ]; firstLevel; secondLevel ]
+
+                            let present = HashSet<string>(StringComparer.OrdinalIgnoreCase)
+
+                            for dir in dirs do
+                                try
+                                    for file in Directory.GetFiles(dir, "*.dll") do
+                                        let name = Path.GetFileName(file)
+
+                                        if apiMarkerNames.Contains(name)
+                                           && (not (wrapperProneNames.Contains(name))
+                                               || not (isModWrapper file)) then
+                                            present.Add(name) |> ignore
+
+                                        // A backend shipped under its own name
+                                        // settles the question by itself, and
+                                        // no wrapper ever takes these names.
+                                        match
+                                            rendererDlls
+                                            |> List.tryFind (fun (n, _) ->
+                                                String.Equals(n, name, StringComparison.OrdinalIgnoreCase))
+                                        with
+                                        | Some(_, api) -> found.Add(api) |> ignore
+                                        | None -> ()
+                                with _ ->
+                                    ()
+
+                            for (api, markers) in apiMarkers do
+                                if markers |> Array.exists present.Contains then
+                                    found.Add(api) |> ignore
+
+                            // vulkan-1.dll beside the game is the loader being
+                            // shipped, which only a Vulkan title does.
+                            if File.Exists(Path.Combine(exeDir, "vulkan-1.dll")) then
+                                found.Add("vulkan") |> ignore
+
+                        let newestDirectX =
+                            [ "dx12"; "dx11"; "dx10"; "dx9" ] |> List.tryFind found.Contains
+
+                        [| yield! Option.toList newestDirectX
+                           if found.Contains("vulkan") then yield "vulkan"
+                           if found.Contains("opengl") then yield "opengl" |]
+                    with _ ->
+                        [||]
+            )
+
+    /// The single API the routing decides on: the newest DirectX generation
+    /// when there is one, else whatever else the title renders with. "" when
+    /// nothing gives it away, exactly as before.
+    let detectGraphicsApi (exePath: string) : string =
+        detectGraphicsApis exePath |> Array.tryHead |> Option.defaultValue ""
 
     /// "32" / "64" straight from the COFF header's machine type - four bytes
     /// read off the front of the file, no loading and no guessing.

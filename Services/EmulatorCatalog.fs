@@ -18,8 +18,10 @@ module EmulatorCatalog =
     /// Which ReShade slot an emulator's renderer actually loads. Everything
     /// here draws through Vulkan except Ryujinx, whose DLSS 5 payload runs on
     /// DirectX 12 instead.
-    let private vulkanApi = "vulkan"
-    let private dx12Api = "dxgi"
+    /// Public because the install sheet offers these two as a choice now: the
+    /// catalogue picks the default, the user may overrule it.
+    let vulkanApi = "vulkan"
+    let dx12Api = "dxgi"
 
     type Emulator =
         { /// Executable names, best first - the first one found in a folder is

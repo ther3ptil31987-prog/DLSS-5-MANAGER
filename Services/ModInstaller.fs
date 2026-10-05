@@ -1,4 +1,4 @@
-namespace DLSS_5_MANAGER.Services
+﻿namespace DLSS_5_MANAGER.Services
 
 open System
 open System.IO
@@ -58,6 +58,19 @@ module ModInstaller =
           /// "1" when the Multipass build of RenoDX (renodx-dlss5.addon64) was
           /// installed in place of the ordinary one. Same rules as above.
           Multipass: string
+          /// "1" when the deep-fried chicken payload went in *instead of*
+          /// RenoDX. Same rules again, and empty on every older manifest.
+          DeepFried: string
+          /// Emulators only: the slot ReShade was hooked on, "vulkan" or
+          /// "dx12", and **only** when the user actually chose it (1.2.7+).
+          ///
+          /// `Api` above cannot answer this. Every route has always written
+          /// `optiApiKey optiApi` into it, which for an emulator was whatever
+          /// the picker happened to default to - "dx12" - however the install
+          /// was really hooked. Reading that back would flip an emulator that
+          /// went in on Vulkan. Empty here means nobody has chosen and the
+          /// catalogue decides, which is what every build before 1.2.7 did.
+          EmuApi: string
           Files: InstalledFile[] }
 
     /// The mutually exclusive install routes offered in the Manage sheet.
@@ -71,6 +84,11 @@ module ModInstaller =
         /// DirectX 9 titles: ReShade is installed on the d3d9 slot and then
         /// moved aside so dgVoodoo can take it.
         | Dx9
+        /// Vulkan titles: the same ReShade route, hooked on the Vulkan layer,
+        /// with the "if Vulkan" payload in RenoDX's place. RenoDX is a DirectX
+        /// add-on, so it - and Multipass, which only picks a build of it - have
+        /// no meaning here. Neural upstream and the MFG unlock still do.
+        | VulkanMode
         /// Emulators: ReShade on Vulkan plus the emulator payload. No RenoDX,
         /// no Streamline - the emulator is the renderer, not the game.
         | Emulator
@@ -106,6 +124,7 @@ module ModInstaller =
         | Dx12Auto -> "dx12"
         | Dx11 -> "dx11"
         | Dx9 -> "dx9"
+        | VulkanMode -> "vulkan"
         | Emulator -> "emulator"
         | AmdMode -> "amd"
 
@@ -197,17 +216,61 @@ module ModInstaller =
         let cleaned = Regex.Replace(raw, @"[^A-Za-z0-9_\-]", "_")
         if cleaned.Length > 80 then cleaned.Substring(0, 80) else cleaned
 
+    /// The install record, written beside the game's executable.
+    ///
+    /// The authoritative copy lives in AppData under a safe id made from the
+    /// game's AppId - or, when it has none, its title. That key is the weak
+    /// point: a re-scan that spells the title differently, or a library that
+    /// moves, loses the record. Removal then takes the "foreign install" path,
+    /// which deletes one file and leaves everything else exactly where it is -
+    /// the OptiScaler .ini among it.
+    ///
+    /// This copy travels with the game folder, so it cannot be lost that way,
+    /// and it says plainly what was added and where it came from.
+    let installRecordName = "dlss5-install.json"
+
     let private manifestPath (game: GameItem) =
         let dir = Path.Combine(appDataRoot (), "Installs")
         Directory.CreateDirectory(dir) |> ignore
         Path.Combine(dir, safeId game + ".json")
+
+    /// The record beside the game itself. "" when we do not know where the
+    /// game is, which is not the same as knowing there is no record.
+    let private sidecarPath (game: GameItem) =
+        try
+            let dir = Path.GetDirectoryName(game.TargetExecutablePath)
+
+            if String.IsNullOrWhiteSpace(dir) then "" else Path.Combine(dir, installRecordName)
+        with _ ->
+            ""
+
+    /// Where this game's record actually is, or "" when there is none.
+    ///
+    /// AppData first, because that is the copy the app has always written and
+    /// the one it can find without knowing where the game lives. The copy
+    /// beside the game is the fallback, and it is what makes the whole thing
+    /// survive a re-scan spelling the title differently.
+    ///
+    /// Everything that reads an install back goes through here. A reader that
+    /// checked AppData alone would report "nothing installed" for an install
+    /// that is plainly there - and `priorEntries` doing that is worse than
+    /// cosmetic: it would start the tracker empty, so our own deployed files
+    /// would be mistaken for the game's originals and backed up as such.
+    let private recordPathFor (game: GameItem) =
+        let primary = manifestPath game
+
+        if File.Exists(primary) then
+            primary
+        else
+            let beside = sidecarPath game
+            if beside <> "" && File.Exists(beside) then beside else ""
 
     let private backupRoot (game: GameItem) =
         let dir = Path.Combine(appDataRoot (), "Backups", safeId game)
         Directory.CreateDirectory(dir) |> ignore
         dir
 
-    let isInstalled (game: GameItem) = File.Exists(manifestPath game)
+    let isInstalled (game: GameItem) = recordPathFor game <> ""
 
     /// The app no longer demands elevation just to start, so a folder Windows
     /// protects - anything under Program Files - has to be found out here and
@@ -396,6 +459,7 @@ module ModInstaller =
         | Dx12Auto
         | Dx11
         | Dx9
+        | VulkanMode
         | Emulator -> true
         | OptiScalerMode
         | AmdMode -> false
@@ -420,6 +484,17 @@ module ModInstaller =
 
     /// Everything an emulator needs on top of the shared payload.
     let emulatorPayloadDirName = "if emulator"
+
+    /// The Vulkan route's payload. The same three files, kept in their own
+    /// folder so that route can be given its own build without disturbing the
+    /// emulator one.
+    let vulkanPayloadDirName = "if Vulkan"
+
+    /// The deep-fried chicken payload. It lives in the emulator folder because
+    /// that is where it shipped first, but the DirectX routes can install it
+    /// too - in RenoDX's place, never beside it.
+    let deepFriedFileNames =
+        [| "deep-fried-chicken-nvngx.dll"; "deep-fried-chicken.addon64"; "deep-fried-chicken.cfg" |]
 
     /// AMD RDNA 4: everything that route needs, and it needs nothing else.
     let amdPayloadDirName = "if amd"
@@ -449,6 +524,13 @@ module ModInstaller =
            "dgVoodoo.conf"; "dgVoodooCpl.exe"
            "deep-fried-chicken-nvngx.dll"; "deep-fried-chicken.addon64"; "deep-fried-chicken.cfg" |]
 
+    /// The effects the in-game overlay writes into the shader folder itself,
+    /// under every name it has used. They are not in any manifest - the
+    /// overlay writes them while the game is running, long after the install -
+    /// so removal has to know them by name or they stay behind for ever.
+    let overlayWrittenEffects =
+        [| "D5Manager_Enhance.fx"; "D5Manager_MFG.fx"; "D5Manager_Enhancer.fx"; "DLSS5_Enhancer.fx" |]
+
     /// One complete effect set for every route - the standard package plus the
     /// DLSS 5 feed shaders - dropped into the game's own "reshade-shaders"
     /// folder so Shaders\ and Textures\ merge into place.
@@ -464,16 +546,32 @@ module ModInstaller =
     /// previous version deployed from it.
     let optiScalerDirName = "if OptiScaler"
 
-    /// The one OptiScaler build that ships. It is hooked exactly like the plain
-    /// one was, so nothing about the route changed except which folder it reads.
+    /// The OptiScaler build every card that is not an RTX 40 installs. It is
+    /// hooked exactly like the plain one was, so nothing about the route
+    /// changed except which folder it reads.
     let optiScalerNeuralDirName = "if OptiScaler neural-upstream"
 
-    /// Which OptiScaler payload an API choice reads from.
+    /// The build for the RTX 40 and 50 series. Same route, same hook, same
+    /// slot - the only difference is the folder, which carries the frame
+    /// generation work those cards need. The folder keeps its original name.
+    let optiScalerRtx40DirName = "if Optiscaler RTX40"
+
+    /// Which OptiScaler payload this machine installs.
     ///
-    /// Both of them read the same one now. The API choice decides only which
-    /// DLL name OptiScaler is dropped in as - `dxgi.dll` for DirectX 12,
-    /// `winmm.dll` for Vulkan - which is what `pickOptiScalerSlot` does.
-    let optiScalerPayloadDirName (_api: OptiScalerApi) = optiScalerNeuralDirName
+    /// Not the API's decision: DirectX 12 and Vulkan read the same folder, and
+    /// all that choice decides is the DLL name OptiScaler is dropped in as -
+    /// `dxgi.dll` or `winmm.dll` - which is what `pickOptiScalerSlot` does.
+    /// The card decides instead, with no switch for the user to get wrong: an
+    /// RTX 40 gets its own build, every other card keeps the one it always had.
+    ///
+    /// A missing RTX 40 folder falls back to the standard build rather than
+    /// failing the install, so a trimmed copy of "mod files" still works.
+    let optiScalerPayloadDirName (_api: OptiScalerApi) =
+        if SystemSpecs.isRtx40 ()
+           && Directory.Exists(Path.Combine(modFilesRoot (), optiScalerRtx40DirName)) then
+            optiScalerRtx40DirName
+        else
+            optiScalerNeuralDirName
 
     /// Exactly the menu OptiScaler's setup offers, in its own order. The first
     /// name the game does not already use is the one that cannot clash.
@@ -519,6 +617,9 @@ module ModInstaller =
     /// And for the neural upstream folder beside it.
     let optiScalerNeuralKey = "OptiScaler neural-upstream"
 
+    /// And for the RTX 40 build, which an RTX 40 card installs instead.
+    let optiScalerRtx40Key = "OptiScaler RTX40"
+
     /// The filenames a route already puts next to the executable.
     ///
     /// An extra carrying one of these names would fight the payload for the
@@ -556,14 +657,20 @@ module ModInstaller =
             // The neural upstream add-on is optional per install, but a route
             // that can carry it still owns the name.
             let addons =
-                Set.ofList
-                    [ renodxAddonName; renodxAddonLegacyName; mfgUnlockAddonName
-                      feedAddonName; feedAddon32Name; neuralAddonName ]
+                Set.union
+                    (Set.ofList
+                        [ renodxAddonName; renodxAddonLegacyName; mfgUnlockAddonName
+                          feedAddonName; feedAddon32Name; neuralAddonName ])
+                    (Set.ofArray deepFriedFileNames)
 
             match routeKey with
             | "optiscaler" ->
                 Set.unionMany
-                    [ model; runtimes; namesIn [ optiScalerDirName ]; namesIn [ optiScalerNeuralDirName ] ]
+                    [ model
+                      runtimes
+                      namesIn [ optiScalerDirName ]
+                      namesIn [ optiScalerNeuralDirName ]
+                      namesIn [ optiScalerRtx40DirName ] ]
             | "amd" ->
                 Set.unionMany
                     [ model; namesIn [ amdPayloadDirName ]; Set.ofArray amdSlots; Set.ofList [ neuralAddonName ] ]
@@ -760,12 +867,22 @@ module ModInstaller =
         let describeOptiScalerNeural () =
             describeOptiFolder optiScalerNeuralDirName optiScalerNeuralKey
 
+        /// The RTX 40 build. It is a whole OptiScaler folder like the other
+        /// one, so it swaps and restores exactly the same way - it was simply
+        /// never given a row of its own, which left the cards that actually use
+        /// it with no way to update it.
+        let describeOptiScalerRtx40 () =
+            describeOptiFolder optiScalerRtx40DirName optiScalerRtx40Key
+
         let private optiFactoryDir () =
             let p = Path.Combine(factoryDir (), "OptiScalerPayload")
             p
 
         let private optiNeuralFactoryDir () =
             Path.Combine(factoryDir (), "OptiScalerNeuralPayload")
+
+        let private optiRtx40FactoryDir () =
+            Path.Combine(factoryDir (), "OptiScalerRtx40Payload")
 
         let private replaceOptiFolder (dirName: string) (key: string) (factory: string) (label: string) (sourceDir: string) : bool * string =
             try
@@ -817,6 +934,14 @@ module ModInstaller =
                 optiScalerNeuralKey
                 (optiNeuralFactoryDir ())
                 "OptiScaler neural-upstream"
+                sourceDir
+
+        let replaceOptiScalerRtx40 (sourceDir: string) : bool * string =
+            replaceOptiFolder
+                optiScalerRtx40DirName
+                optiScalerRtx40Key
+                (optiRtx40FactoryDir ())
+                "OptiScaler RTX 40"
                 sourceDir
 
         // -----------------------------------------------------------------
@@ -952,6 +1077,13 @@ module ModInstaller =
                 (optiNeuralFactoryDir ())
                 "OptiScaler neural-upstream"
 
+        let restoreOptiScalerRtx40 () : bool * string =
+            restoreOptiFolder
+                optiScalerRtx40DirName
+                optiScalerRtx40Key
+                (optiRtx40FactoryDir ())
+                "OptiScaler RTX 40"
+
     /// What the app can tell about a game just by looking at its files.
     /// `nvngx_dlssnr.dll` is the one file DLSS 5 cannot run without, so its
     /// presence alone means "DLSS 5 is already on this game".
@@ -968,11 +1100,319 @@ module ModInstaller =
         if String.IsNullOrWhiteSpace(modRoot) then zeroVer
         else readFileVersion (Path.Combine(modRoot, relativePath))
 
+    // =====================================================================
+    // PROXY NAME (optional, Manage sheet -> "DLL name")
+    // =====================================================================
+    /// The two proxies the user may give a different name after an install.
+    /// Nothing about the install itself changes: it still picks the name it
+    /// always did, and this only moves the file afterwards when asked.
+    type ProxyKind =
+        | OptiScalerProxyDll
+        | ReShadeProxyDll
+
+    /// The names offered in the list. Any other name can be typed in.
+    let optiScalerProxyNames =
+        [| "dxgi.dll"; "winmm.dll"; "version.dll"; "dbghelp.dll"; "d3d12.dll"; "wininet.dll"; "winhttp.dll" |]
+
+    let reShadeProxyNames =
+        [| "dxgi.dll"; "winmm.dll"; "version.dll"; "d3d12.dll"; "wininet.dll"; "winhttp.dll"
+           "d3d11.dll"; "d3d9.dll"; "opengl32.dll" |]
+
+    /// Is this file the given proxy? OptiScaler keeps its original filename in
+    /// the version resource whatever it is called; ReShade keeps its product name.
+    let private isProxyOf (kind: ProxyKind) (path: string) =
+        try
+            File.Exists(path)
+            && (let fvi = FileVersionInfo.GetVersionInfo(path)
+
+                match kind with
+                | OptiScalerProxyDll ->
+                    not (isNull fvi.OriginalFilename)
+                    && fvi.OriginalFilename.Equals("OptiScaler.dll", StringComparison.OrdinalIgnoreCase)
+                | ReShadeProxyDll -> not (isNull fvi.ProductName) && fvi.ProductName.Contains("ReShade"))
+        with _ ->
+            false
+
+    let private readManifest (game: GameItem) : InstallManifest option =
+        try
+            let path = recordPathFor game
+
+            if path <> "" && File.Exists(path) then
+                let options = JsonSerializerOptions()
+                options.PropertyNameCaseInsensitive <- true
+                let m = JsonSerializer.Deserialize<InstallManifest>(File.ReadAllText(path), options)
+                if isNull (box m) then None else Some m
+            else
+                None
+        with _ ->
+            None
+
+    /// Where this install's proxy of that kind is right now, or "" when the
+    /// install has none. Only files the install recorded count, so a ReShade
+    /// the game shipped with on its own is never taken for ours.
+    let installedProxyPath (game: GameItem) (kind: ProxyKind) : string =
+        match readManifest game with
+        | Some m when not (isNull (box m.Files)) ->
+            let exeDir =
+                try Path.GetDirectoryName(m.ExecutablePath) with _ -> ""
+
+            // A proxy sits beside the executable and is never one of the NVIDIA
+            // runtimes. Reading the version resource of every recorded DLL -
+            // the OptiScaler tree, the 165 MB model just copied in, which the
+            // antivirus is often still scanning - is what froze the sheet for
+            // seconds after an install.
+            let candidate (path: string) =
+                let name = Path.GetFileName(path)
+
+                (String.IsNullOrWhiteSpace(exeDir)
+                 || String.Equals(Path.GetDirectoryName(path), exeDir, StringComparison.OrdinalIgnoreCase))
+                && not (name.StartsWith("nvngx", StringComparison.OrdinalIgnoreCase))
+                && not (name.StartsWith("sl.", StringComparison.OrdinalIgnoreCase))
+
+            m.Files
+            |> Array.tryFind (fun f ->
+                not (String.IsNullOrWhiteSpace(f.TargetPath))
+                && f.TargetPath.EndsWith(".dll", StringComparison.OrdinalIgnoreCase)
+                && candidate f.TargetPath
+                // ReShade64.dll / ReShade32.dll are a Vulkan layer, loaded by
+                // the name its .json gives - renaming them would unhook it.
+                && not (Path.GetFileName(f.TargetPath).StartsWith("ReShade", StringComparison.OrdinalIgnoreCase))
+                && isProxyOf kind f.TargetPath)
+            |> Option.map (fun f -> f.TargetPath)
+            |> Option.defaultValue ""
+        | _ -> ""
+
+    /// "name" or "name.dll" typed by the user -> "name.dll", or "" when it is
+    /// not something Windows can use as a file name.
+    let normalizeProxyName (typed: string) : string =
+        if String.IsNullOrWhiteSpace(typed) then
+            ""
+        else
+            let t = typed.Trim()
+
+            let stem =
+                if t.EndsWith(".dll", StringComparison.OrdinalIgnoreCase) then t.Substring(0, t.Length - 4) else t
+
+            if stem.Trim() = ""
+               || stem.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0
+               || stem.EndsWith(".")
+               || stem.EndsWith(" ") then
+                ""
+            else
+                stem + ".dll"
+
+    /// Moves an installed proxy to another name, keeping the install fully
+    /// reversible: a game file already on the new name is backed up first and
+    /// recorded, and a game file the proxy had replaced on the old name is put
+    /// back straight away. Both records - AppData and beside the game - are
+    /// rewritten, so removal undoes exactly what is on disk.
+    let renameProxy (game: GameItem) (kind: ProxyKind) (typedName: string) : InstallOutcome =
+        let label =
+            match kind with
+            | OptiScalerProxyDll -> "OptiScaler"
+            | ReShadeProxyDll -> "ReShade"
+
+        let newName = normalizeProxyName typedName
+
+        try
+            match readManifest game with
+            | None ->
+                { Success = false
+                  Message = "Install DLSS 5 on this game first - there is nothing to rename yet." }
+            | Some _ when newName = "" -> { Success = false; Message = "That is not a valid file name." }
+            | Some m ->
+                let files = if isNull (box m.Files) then [||] else m.Files
+                let current = installedProxyPath game kind
+
+                if current = "" then
+                    { Success = false; Message = sprintf "This install has no %s DLL to rename." label }
+                else
+                    let dir = Path.GetDirectoryName(current)
+                    let target = Path.Combine(dir, newName)
+                    let same (a: string) (b: string) = String.Equals(a, b, StringComparison.OrdinalIgnoreCase)
+
+                    if same current target then
+                        { Success = true; Message = sprintf "%s is already %s." label newName }
+                    elif File.Exists(target) && (files |> Array.exists (fun f -> same f.TargetPath target)) then
+                        { Success = false
+                          Message = sprintf "%s is already used by another file of this install - pick another name." newName }
+                    elif isProxyOf OptiScalerProxyDll target || isProxyOf ReShadeProxyDll target then
+                        { Success = false
+                          Message = sprintf "%s is already another mod's proxy - pick another name." newName }
+                    elif File.Exists(target) then
+                        // Reserved: the game (or something else) already has a
+                        // file by that name. It is never replaced.
+                        { Success = false
+                          Message = sprintf "%s is already a file in the game folder - pick another name." newName }
+                    else
+                        let existed = File.Exists(target)
+
+                        let backup =
+                            if existed then
+                                let bp = Path.Combine(backupRoot game, shortHash target + "_" + newName)
+                                if not (File.Exists(bp)) then File.Copy(target, bp, false)
+                                bp
+                            else
+                                ""
+
+                        let old = files |> Array.find (fun f -> same f.TargetPath current)
+                        File.Move(current, target, true)
+
+                        // The game's own file the proxy had replaced goes back now -
+                        // but only a real game file. What was backed up there can
+                        // be a proxy from an earlier route (a ReShade dxgi.dll under
+                        // an OptiScaler install); putting that back would hook the
+                        // game twice. It stays in the backup, and the old entry
+                        // stays in the record, so removal treats it as it always did.
+                        let backupIsProxy =
+                            old.WasExisting
+                            && (isProxyOf OptiScalerProxyDll old.BackupPath || isProxyOf ReShadeProxyDll old.BackupPath)
+
+                        if old.WasExisting && not backupIsProxy && File.Exists(old.BackupPath) then
+                            File.Copy(old.BackupPath, current, true)
+
+                        // Back onto a name the record still holds (one kept above):
+                        // its original backup is still the truth about that name.
+                        let entry =
+                            match files |> Array.tryFind (fun f -> same f.TargetPath target) with
+                            | Some prior when not existed -> prior
+                            | _ ->
+                                { TargetPath = target
+                                  BackupPath = backup
+                                  WasExisting = existed }
+
+                        let keepOld (f: InstalledFile) = backupIsProxy && same f.TargetPath current
+
+                        let newFiles =
+                            Array.append
+                                (files
+                                 |> Array.filter (fun f ->
+                                     keepOld f || (not (same f.TargetPath current) && not (same f.TargetPath target))))
+                                [| entry |]
+
+                        let options = JsonSerializerOptions()
+                        options.WriteIndented <- true
+                        let json = JsonSerializer.Serialize({ m with Files = newFiles }, options)
+                        File.WriteAllText(manifestPath game, json)
+
+                        try
+                            let beside = Path.Combine(Path.GetDirectoryName(m.ExecutablePath), installRecordName)
+                            if File.Exists(beside) then File.WriteAllText(beside, json)
+                        with _ ->
+                            ()
+
+                        { Success = true
+                          Message = sprintf "%s renamed: %s -> %s." label (Path.GetFileName(current)) newName }
+        with ex ->
+            { Success = false; Message = sprintf "Could not rename %s: %s" label ex.Message }
+
+    /// What the DLL NAME card needs, read once and kept in `dll_names.json`:
+    /// the two proxies' names now, and every DLL already in their folder - the
+    /// names that are taken. Read again only when the install record changes
+    /// (an install, a switch, a removal, a rename) or the sheet's refresh
+    /// button asks (`forgetProxyNames`).
+    [<CLIMutable>]
+    type ProxyNamesInfo =
+        { OptiName: string
+          ReShadeName: string
+          FolderDlls: string[]
+          Stamp: int64 }
+
+    let private proxyCacheLock = obj ()
+
+    let private proxyCache =
+        lazy
+            (let d = Dictionary<string, ProxyNamesInfo>(StringComparer.OrdinalIgnoreCase)
+
+             try
+                 let path = Path.Combine(appDataRoot (), "dll_names.json")
+
+                 if File.Exists(path) then
+                     let loaded =
+                         JsonSerializer.Deserialize<Dictionary<string, ProxyNamesInfo>>(File.ReadAllText(path))
+
+                     if not (isNull loaded) then
+                         for pair in loaded do
+                             if not (isNull (box pair.Value)) then d.[pair.Key] <- pair.Value
+             with _ ->
+                 ()
+
+             d)
+
+    let private saveProxyCache () =
+        try
+            File.WriteAllText(Path.Combine(appDataRoot (), "dll_names.json"), JsonSerializer.Serialize(proxyCache.Value))
+        with _ ->
+            ()
+
+    /// When the install record was last written; 0 when there is none.
+    let private recordStamp (game: GameItem) =
+        try
+            let p = recordPathFor game
+            if p = "" then 0L else File.GetLastWriteTimeUtc(p).Ticks
+        with _ ->
+            0L
+
+    let private scanProxyNames (game: GameItem) (stamp: int64) : ProxyNamesInfo =
+        let opti = installedProxyPath game OptiScalerProxyDll
+        let reshade = installedProxyPath game ReShadeProxyDll
+
+        let dir =
+            if opti <> "" then Path.GetDirectoryName(opti)
+            elif reshade <> "" then Path.GetDirectoryName(reshade)
+            else ""
+
+        let dlls =
+            try
+                if dir <> "" && Directory.Exists(dir) then
+                    Directory.GetFiles(dir, "*.dll") |> Array.map (fun p -> Path.GetFileName(p).ToLowerInvariant())
+                else
+                    [||]
+            with _ ->
+                [||]
+
+        { OptiName = (if opti = "" then "" else Path.GetFileName(opti))
+          ReShadeName = (if reshade = "" then "" else Path.GetFileName(reshade))
+          FolderDlls = dlls
+          Stamp = stamp }
+
+    /// The kept answer, if it still describes the install on disk. Cheap: one
+    /// file date - safe on the UI thread.
+    let tryCachedProxyNames (game: GameItem) : ProxyNamesInfo option =
+        let stamp = recordStamp game
+        let key = safeId game
+
+        lock proxyCacheLock (fun () ->
+            match proxyCache.Value.TryGetValue(key) with
+            | true, v when v.Stamp = stamp -> Some v
+            | _ -> None)
+
+    /// Reads it from the disk and keeps it. Opens files - run it off the UI thread.
+    let proxyNames (game: GameItem) : ProxyNamesInfo =
+        let stamp = recordStamp game
+
+        let info =
+            if stamp = 0L then
+                { OptiName = ""; ReShadeName = ""; FolderDlls = [||]; Stamp = 0L }
+            else
+                scanProxyNames game stamp
+
+        lock proxyCacheLock (fun () ->
+            proxyCache.Value.[safeId game] <- info
+            saveProxyCache ())
+
+        info
+
+    /// The sheet's refresh button: the next read goes to the disk.
+    let forgetProxyNames (game: GameItem) =
+        lock proxyCacheLock (fun () ->
+            if proxyCache.Value.Remove(safeId game) then saveProxyCache ())
+
     /// Route and build a managed install used. Both are "" when this app did
     /// not install it; a manifest from before 1.1.0 reads back as 64-bit.
     let installedRouteAndArch (game: GameItem) : string * string =
         try
-            let path = manifestPath game
+            let path = recordPathFor game
 
             if File.Exists(path) then
                 let options = JsonSerializerOptions()
@@ -992,7 +1432,7 @@ module ModInstaller =
     /// older manifest reads back as - those were all DirectX 12.
     let installedOptiApi (game: GameItem) : string =
         try
-            let path = manifestPath game
+            let path = recordPathFor game
 
             if File.Exists(path) then
                 let options = JsonSerializerOptions()
@@ -1009,7 +1449,7 @@ module ModInstaller =
     /// those installs were.
     let installedNeuralAddon (game: GameItem) : bool =
         try
-            let path = manifestPath game
+            let path = recordPathFor game
 
             if File.Exists(path) then
                 let options = JsonSerializerOptions()
@@ -1026,7 +1466,7 @@ module ModInstaller =
     /// (false, false), which is what those installs were.
     let installedRenoDxOptions (game: GameItem) : bool * bool =
         try
-            let path = manifestPath game
+            let path = recordPathFor game
 
             if File.Exists(path) then
                 let options = JsonSerializerOptions()
@@ -1037,6 +1477,280 @@ module ModInstaller =
                 (false, false)
         with _ ->
             (false, false)
+
+    /// Whether the recorded install put the in-game overlay in: Some for a
+    /// game this app installed, None for any other. Read from the files the
+    /// install placed, so it answers for every manifest ever written.
+    let installedOverlay (game: GameItem) : bool option =
+        try
+            let path = recordPathFor game
+
+            if File.Exists(path) then
+                let options = JsonSerializerOptions()
+                options.PropertyNameCaseInsensitive <- true
+                let m = JsonSerializer.Deserialize<InstallManifest>(File.ReadAllText(path), options)
+                let files = if isNull m.Files then [||] else m.Files
+
+                let isOverlay (file: InstalledFile) =
+                    not (isNull (box file)) && not (String.IsNullOrWhiteSpace(file.TargetPath))
+                    && (let name = Path.GetFileName(file.TargetPath)
+                        String.Equals(name, overlayAddonName, StringComparison.OrdinalIgnoreCase)
+                        || String.Equals(name, overlayAddon32Name, StringComparison.OrdinalIgnoreCase))
+
+                Some(files |> Array.exists isOverlay)
+            else
+                None
+        with _ ->
+            None
+
+    /// Whether the recorded install put deep-fried chicken in instead of
+    /// RenoDX. Read separately from the pair above so a manifest written before
+    /// the option existed - and every caller of that pair - is left untouched.
+    let installedDeepFried (game: GameItem) : bool =
+        try
+            let path = recordPathFor game
+
+            if File.Exists(path) then
+                let options = JsonSerializerOptions()
+                options.PropertyNameCaseInsensitive <- true
+                let m = JsonSerializer.Deserialize<InstallManifest>(File.ReadAllText(path), options)
+                not (String.IsNullOrWhiteSpace(m.DeepFried))
+            else
+                false
+        with _ ->
+            false
+
+    /// The slot an emulator install was hooked on, as the user chose it:
+    /// "vulkan", "dx12", or "" when nobody has chosen.
+    ///
+    /// "" is what every manifest written before 1.2.7 answers, and it is the
+    /// honest answer - those builds had no such choice. The caller falls back
+    /// to the catalogue there, which is exactly how they behaved.
+    let installedEmulatorApi (game: GameItem) : string =
+        try
+            let path = recordPathFor game
+
+            if File.Exists(path) then
+                let options = JsonSerializerOptions()
+                options.PropertyNameCaseInsensitive <- true
+                let m = JsonSerializer.Deserialize<InstallManifest>(File.ReadAllText(path), options)
+                if isNull m.EmuApi then "" else m.EmuApi
+            else
+                ""
+        with _ ->
+            ""
+
+    // =====================================================================
+    // RESHADE'S OWN KEY AND THE OVERLAY'S KEY
+    //
+    // Both are edits to files ReShade and the overlay already read, made once
+    // an install has finished - never during it, when ReShade's setup is still
+    // writing those same files.
+    //
+    // ONE CLICK DLSS 5 used to be here too, rewriting the preset on disk. It
+    // lives in the in-game overlay now: the effect order, the switches and the
+    // provider are ReShade's live state, so they are changed through ReShade
+    // once it has loaded in the game, not in files behind its back.
+    // =====================================================================
+
+    /// The keys offered for opening ReShade in game. Deliberately few, and
+    /// deliberately not free-form: each is a key games rarely bind.
+    let reshadeKeys = [| "Home"; "End"; "Insert"; "Page Up"; "Page Down" |]
+
+    let private reshadeKeyCode (name: string) =
+        match name with
+        | "End" -> 0x23
+        | "Insert" -> 0x2D
+        | "Page Up" -> 0x21
+        | "Page Down" -> 0x22
+        | _ -> 0x24
+
+    let private reshadeKeyFile () =
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "DLSS5Manager", "reshade_key.txt")
+
+    let savedReShadeKey () =
+        try
+            let v = File.ReadAllText(reshadeKeyFile ()).Trim()
+            if reshadeKeys |> Array.contains v then v else reshadeKeys.[0]
+        with _ ->
+            reshadeKeys.[0]
+
+    let saveReShadeKey (name: string) =
+        try
+            Directory.CreateDirectory(Path.GetDirectoryName(reshadeKeyFile ())) |> ignore
+            File.WriteAllText(reshadeKeyFile (), name)
+        with _ ->
+            ()
+
+    /// The keys offered for opening OptiScaler's own in-game menu.
+    ///
+    /// OptiScaler reads one virtual-key code from [Menu] ShortcutKey in its
+    /// OptiScaler.ini - no modifiers, unlike the overlay's - and "auto" means
+    /// its own default, Insert. The list is the same kind of shortlist as
+    /// ReShade's: keys a game is unlikely to have bound, plus Auto for people
+    /// who have no reason to change it.
+    let optiMenuKeys =
+        [| "Auto"; "Insert"; "Home"; "End"; "Delete"; "Page Up"; "Page Down"
+           "F5"; "F6"; "F7"; "F8"; "F11"; "Backspace" |]
+
+    /// What goes on the right of ShortcutKey=. "auto" is written as the word,
+    /// exactly as the file ships; everything else as the hex the comment above
+    /// that line describes, so the file still reads the way it documents itself.
+    let optiMenuKeyCode (name: string) =
+        match name with
+        | "Insert" -> "0x2D"
+        | "Home" -> "0x24"
+        | "End" -> "0x23"
+        | "Delete" -> "0x2E"
+        | "Page Up" -> "0x21"
+        | "Page Down" -> "0x22"
+        | "F5" -> "0x74"
+        | "F6" -> "0x75"
+        | "F7" -> "0x76"
+        | "F8" -> "0x77"
+        | "F11" -> "0x7A"
+        | "Backspace" -> "0x08"
+        | _ -> "auto"
+
+    let private optiMenuKeyFile () =
+        Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "DLSS5Manager",
+            "optiscaler_menu_key.txt"
+        )
+
+    let savedOptiMenuKey () =
+        try
+            let v = File.ReadAllText(optiMenuKeyFile ()).Trim()
+            if optiMenuKeys |> Array.contains v then v else optiMenuKeys.[0]
+        with _ ->
+            optiMenuKeys.[0]
+
+    let saveOptiMenuKey (name: string) =
+        try
+            Directory.CreateDirectory(Path.GetDirectoryName(optiMenuKeyFile ())) |> ignore
+            File.WriteAllText(optiMenuKeyFile (), name)
+        with _ ->
+            ()
+
+    /// The body of one section: (first line, one past the last). "" is the
+    /// part of the file before any section, which is where a ReShade preset
+    /// keeps its technique list.
+    let private iniRange (lines: ResizeArray<string>) (section: string) : int * int =
+        let isHeader (l: string) = l.TrimStart().StartsWith("[")
+
+        if section = "" then
+            let mutable e = 0
+            while e < lines.Count && not (isHeader lines.[e]) do
+                e <- e + 1
+            (0, e)
+        else
+            let header = "[" + section + "]"
+            let mutable s = -1
+            let mutable i = 0
+
+            while s < 0 && i < lines.Count do
+                if lines.[i].Trim().Equals(header, StringComparison.OrdinalIgnoreCase) then s <- i + 1
+                i <- i + 1
+
+            if s < 0 then
+                (-1, -1)
+            else
+                let mutable e = s
+                while e < lines.Count && not (isHeader lines.[e]) do
+                    e <- e + 1
+                (s, e)
+
+    let private keyOf (line: string) =
+        let eq = line.IndexOf('=')
+        if eq > 0 then line.Substring(0, eq).Trim() else ""
+
+    let private readIni (path: string) (section: string) (key: string) =
+        try
+            if not (File.Exists(path)) then
+                ""
+            else
+                let lines = ResizeArray<string>(File.ReadAllLines(path))
+                let (s, e) = iniRange lines section
+
+                if s < 0 then
+                    ""
+                else
+                    seq { s .. e - 1 }
+                    |> Seq.tryPick (fun i ->
+                        let l = lines.[i]
+                        if (keyOf l).Equals(key, StringComparison.OrdinalIgnoreCase) then
+                            Some(l.Substring(l.IndexOf('=') + 1).Trim())
+                        else
+                            None)
+                    |> Option.defaultValue ""
+        with _ ->
+            ""
+
+    /// Sets one key, keeping every other line exactly as it was. The key - and
+    /// the section - are created when missing.
+    let private writeIni (path: string) (section: string) (key: string) (value: string) =
+        let lines = ResizeArray<string>(if File.Exists(path) then File.ReadAllLines(path) else [||])
+        let entry = key + "=" + value
+        let (s, e) = iniRange lines section
+
+        if s < 0 then
+            if lines.Count > 0 && lines.[lines.Count - 1].Trim() <> "" then lines.Add("")
+            lines.Add("[" + section + "]")
+            lines.Add(entry)
+        else
+            let found =
+                seq { s .. e - 1 }
+                |> Seq.tryFind (fun i -> (keyOf lines.[i]).Equals(key, StringComparison.OrdinalIgnoreCase))
+
+            match found with
+            | Some i -> lines.[i] <- entry
+            | None -> lines.Insert(s, entry)
+
+        File.WriteAllLines(path, lines)
+
+    /// The key that opens ReShade: [INPUT] KeyOverlay=key,ctrl,shift,alt in the
+    /// game's own ReShade.ini.
+    let applyReShadeKey (exeDir: string) (name: string) =
+        let ini = Path.Combine(exeDir, "ReShade.ini")
+
+        if File.Exists(ini) then
+            try
+                writeIni ini "INPUT" "KeyOverlay" (sprintf "%d,0,0,0" (reshadeKeyCode name))
+            with _ ->
+                ()
+
+    /// The key that opens the DLSS 5 overlay, in the ini it reads beside the
+    /// game - and inside host64, where a 32-bit install keeps a second copy.
+    let applyOverlayKey (exeDir: string) (binding: string) =
+        let (key, ctrl, shift, alt) = parseOverlayHotkey binding
+        let flag (v: bool) = if v then "true" else "false"
+
+        for dir in [ exeDir; Path.Combine(exeDir, host64DirName) ] do
+            let ini = Path.Combine(dir, overlayConfigName)
+
+            if File.Exists(ini) then
+                try
+                    writeIni ini "Overlay" "HotKey" (string key)
+                    writeIni ini "Overlay" "HotKeyCtrl" (flag ctrl)
+                    writeIni ini "Overlay" "HotKeyShift" (flag shift)
+                    writeIni ini "Overlay" "HotKeyAlt" (flag alt)
+                with _ ->
+                    ()
+
+    /// The key that opens OptiScaler's own menu, in the OptiScaler.ini that was
+    /// installed beside the game. Only that one line changes: everything
+    /// OptiScaler ships in the file - and everything the player has since set
+    /// in its menu - is kept exactly as it is. Nothing happens when the file is
+    /// not there, which is every route that is not OptiScaler.
+    let applyOptiScalerMenuKey (exeDir: string) (name: string) =
+        let ini = Path.Combine(exeDir, "OptiScaler.ini")
+
+        if File.Exists(ini) then
+            try
+                writeIni ini "Menu" "ShortcutKey" (optiMenuKeyCode name)
+            with _ ->
+                ()
 
     let inspect (game: GameItem) (exePath: string) (dlssDirs: string[]) (streamlineDirs: string[]) : Dlss5Status =
         let managed = isInstalled game
@@ -1098,10 +1812,13 @@ module ModInstaller =
                 let hooked =
                     optiScalerSlots
                     |> Array.exists (fun n -> File.Exists(Path.Combine(exeDir, n)))
+                    // A proxy the user renamed in the Manage sheet.
+                    || installedProxyPath game OptiScalerProxyDll <> ""
 
                 if not hooked then missing.Add("OptiScaler proxy library")
             elif is32BitInstall then
-                if not (GameAnalyzer.isReShadeInstalled exePath) then missing.Add("ReShade")
+                if not (GameAnalyzer.isReShadeInstalled exePath || installedProxyPath game ReShadeProxyDll <> "") then
+                    missing.Add("ReShade")
 
                 if not (File.Exists(Path.Combine(exeDir, feedAddon32Name))) then
                     missing.Add("32-bit DLSS 5 feed add-on")
@@ -1109,12 +1826,16 @@ module ModInstaller =
                 if not (File.Exists(Path.Combine(exeDir, host64DirName, "dlss5-feed-host64.exe"))) then
                     missing.Add("64-bit host")
             else
-                if not (GameAnalyzer.isReShadeInstalled exePath) then missing.Add("ReShade")
+                if not (GameAnalyzer.isReShadeInstalled exePath || installedProxyPath game ReShadeProxyDll <> "") then
+                    missing.Add("ReShade")
 
                 // The Multipass option installs renodx-dlss5 in place of
-                // renodx-dlss, so either one is RenoDX being there.
+                // renodx-dlss, so either one is RenoDX being there. Deep-fried
+                // chicken - and the Vulkan payload, which ships the same files -
+                // goes in RenoDX's place, so its add-on fills that slot too.
                 if not (File.Exists(Path.Combine(exeDir, renodxAddonName)))
-                   && not (File.Exists(Path.Combine(exeDir, renodxAddonLegacyName))) then
+                   && not (File.Exists(Path.Combine(exeDir, renodxAddonLegacyName)))
+                   && not (File.Exists(Path.Combine(exeDir, "deep-fried-chicken.addon64"))) then
                     missing.Add("RenoDX DLSS 5 add-on")
 
                 if not (File.Exists(Path.Combine(exeDir, feedAddonName))) then
@@ -1644,6 +2365,10 @@ module ModInstaller =
         /// the ordinary one. Every other route ignores both.
         (mfgUnlock: bool)
         (multipass: bool)
+        /// Deep-fried chicken in place of RenoDX, on the DirectX routes only.
+        /// It takes RenoDX's slot, so Multipass - which only decides which
+        /// RenoDX build goes in - is switched off alongside it.
+        (deepFried: bool)
         /// The in-game overlay, as set up in Settings. Ignored on any route
         /// `overlaySupported` says no to.
         (overlay: OverlayOptions)
@@ -1653,7 +2378,7 @@ module ModInstaller =
         // installer to repair a broken install stays fully reversible.
         let priorEntries =
             try
-                let path = manifestPath game
+                let path = recordPathFor game
 
                 if File.Exists(path) then
                     let options = JsonSerializerOptions()
@@ -1666,6 +2391,17 @@ module ModInstaller =
                 [||]
 
         let tracker = Tracker(backupRoot game, priorEntries)
+
+        // A proxy the user renamed after an earlier install (Manage sheet ->
+        // DLL name) sits where the usual checks do not look.
+        let priorProxies kind =
+            priorEntries
+            |> Array.filter (fun f ->
+                not (String.IsNullOrWhiteSpace(f.TargetPath))
+                && f.TargetPath.EndsWith(".dll", StringComparison.OrdinalIgnoreCase)
+                && isProxyOf kind f.TargetPath)
+
+        let priorReShade = (priorProxies ReShadeProxyDll).Length > 0
 
         try
             report "Preparing installation..." 0.03
@@ -1695,8 +2431,30 @@ module ModInstaller =
             // the DX12 / DX11 / DX9 routes on a 64-bit game. A 32-bit install
             // carries no RenoDX at all.
             let renodxRoute = (mode = Dx12Auto || mode = Dx11 || mode = Dx9) && arch <> Bit32
-            let mfgUnlockWanted = mfgUnlock && renodxRoute
-            let multipassWanted = multipass && renodxRoute
+
+            // The Vulkan route is the ReShade route hooked on the Vulkan layer.
+            // RenoDX is a DirectX add-on, so it never goes in here - the payload
+            // takes its place instead, always, not as an option.
+            let vulkanRoute = (mode = VulkanMode)
+
+            // MFG unlock is the one RenoDX-era option that still applies here.
+            let mfgUnlockWanted = mfgUnlock && (renodxRoute || vulkanRoute)
+
+            // Deep-fried chicken stands in for RenoDX, so Multipass - which only
+            // decides which RenoDX build goes in - has nothing left to choose.
+            // On the Vulkan route the payload is not optional, which is why
+            // this is true there regardless of what was ticked.
+            // On Vulkan it is a switch like everywhere else now - on by default
+            // there, since Vulkan has no RenoDX and this is the effect itself.
+            let deepFriedWanted = deepFried && (renodxRoute || vulkanRoute)
+
+            // DX9 and DX11 on a 32-bit game take the payload as well, but cannot
+            // load any of it directly - nothing 64-bit can be loaded into a
+            // 32-bit process. It goes into host64 beside the game instead,
+            // where the rest of the 64-bit modules already run, and the
+            // tracker records every file so removal unwinds it like the rest.
+            let deepFriedHost64 = deepFried && (mode = Dx9 || mode = Dx11) && arch = Bit32
+            let multipassWanted = multipass && renodxRoute && not deepFriedWanted
 
             // The overlay only travels with the routes that can actually host
             // it, whatever the settings page happens to say.
@@ -1722,11 +2480,25 @@ module ModInstaller =
                       Neural = (if neuralWanted then "1" else "")
                       MfgUnlock = (if mfgUnlockWanted then "1" else "")
                       Multipass = (if multipassWanted then "1" else "")
+                      DeepFried = (if deepFriedWanted || deepFriedHost64 then "1" else "")
+                      EmuApi = (if mode = Emulator then optiApiKey optiApi else "")
                       Files = tracker.Entries }
 
                 let options = JsonSerializerOptions()
                 options.WriteIndented <- true
-                File.WriteAllText(manifestPath game, JsonSerializer.Serialize(manifest, options))
+                let json = JsonSerializer.Serialize(manifest, options)
+                File.WriteAllText(manifestPath game, json)
+
+                // The same record, beside the executable. It is what removal
+                // falls back on when the AppData copy cannot be found - see
+                // `installRecordName`. A folder we could not write to would
+                // have failed `canWriteTo` long before here, so this guard is
+                // only against the genuinely unexpected: an install that still
+                // works is better than one that fails over its own receipt.
+                try
+                    File.WriteAllText(Path.Combine(exeDir, installRecordName), json)
+                with _ ->
+                    ()
 
             if not (canWriteTo exeDir) then
                 { Success = false; Message = elevationNeededMessage }
@@ -1755,6 +2527,16 @@ module ModInstaller =
                 report "Clearing previous OptiScaler hooks..." 0.10
                 clearStaleOptiScalerHooks exeDir |> ignore
 
+                // ...and one renamed to a name outside the usual slots, so the
+                // game cannot end up hooked twice. A game file it had replaced
+                // goes back in its place.
+                for f in priorProxies OptiScalerProxyDll do
+                    try
+                        if f.WasExisting && File.Exists(f.BackupPath) then File.Copy(f.BackupPath, f.TargetPath, true)
+                        else File.Delete(f.TargetPath)
+                    with _ ->
+                        ()
+
                 let slotName = pickOptiScalerSlot exeDir (optiApi = OptiVulkan)
                 let optiDll = Path.Combine(optiRoot, "OptiScaler.dll")
 
@@ -1763,17 +2545,19 @@ module ModInstaller =
                 // Skipped on purpose: the model is deployed once from "mod
                 // files" rather than copied twice, OptiScaler.dll goes straight
                 // to its proxy name, and the setup scripts are never needed in
-                // the game folder because nothing runs them. The last four are
-                // the neural upstream payload's own reading material and the
-                // manifest its download script works from - the licences under
-                // Licenses\ still travel, as they always did.
+                // the game folder because nothing runs them. The trees at the
+                // end are the payload's own reading material - documentation,
+                // sponsor images, test notes, and the RTX 40 build's design
+                // notes - plus the manifest its download script works from. The
+                // licences under Licenses\ still travel, as they always did.
                 let deployed =
                     copyTreeExcept
                         tracker
                         optiRoot
                         exeDir
                         [| dlssnrFileName; "OptiScaler.dll"; "setup_windows.bat"; "setup_linux.sh"
-                           "README.md"; "INSTALL-DLSSNR.md"; "get_streamline.ps1"; "docs\\"; "redist\\" |]
+                           "README.md"; "INSTALL-DLSSNR.md"; "get_streamline.ps1"
+                           "docs\\"; "redist\\"; "images\\"; "tests\\"; "OptiScaler\\dlssnr\\" |]
 
                 report (sprintf "Hooking OptiScaler as %s..." slotName) 0.42
                 tracker.Copy(optiDll, Path.Combine(exeDir, slotName))
@@ -1919,8 +2703,17 @@ module ModInstaller =
                 // differs from the DLL-swap routes - the setup can leave
                 // several files behind - so we note what was there first and
                 // record whatever is new.
-                let emulatorApi = EmulatorCatalog.reShadeApi exePath
-                let isVulkanEmulator = emulatorApi = "vulkan"
+                // The catalogue knows what each emulator renders with, and that
+                // is what an untouched sheet offers. The user may overrule it,
+                // and that choice arrives in `optiApi` - the field the manifest
+                // already records for every route, so it survives a reopen.
+                let emulatorApi =
+                    match optiApi with
+                    | OptiVulkan -> EmulatorCatalog.vulkanApi
+                    | OptiDx12 -> EmulatorCatalog.dx12Api
+                    | OptiNeural -> EmulatorCatalog.reShadeApi exePath
+
+                let isVulkanEmulator = emulatorApi = EmulatorCatalog.vulkanApi
                 report (sprintf "Installing ReShade runtime (%s)..." emulatorApi) 0.10
 
                 let reshadeArtifacts =
@@ -1939,7 +2732,7 @@ module ModInstaller =
                     if not (ExtrasStore.isPayloadEnabled reShadeSetupKey) then
                         report "ReShade setup is switched off, skipping." 0.16
                         (true, "")
-                    elif not isVulkanEmulator && GameAnalyzer.isReShadeInstalled exePath then
+                    elif not isVulkanEmulator && (GameAnalyzer.isReShadeInstalled exePath || priorReShade) then
                         // Re-running the setup over an existing ReShade returns
                         // a non-zero exit code, and on this route only the
                         // DLL-swap install leaves something to find.
@@ -2006,6 +2799,16 @@ module ModInstaller =
             let renodxName = if multipassWanted then renodxAddonLegacyName else renodxAddonName
             let addonFile = Path.Combine(modRoot, renodxName)
             let mfgUnlockFile = Path.Combine(modRoot, mfgUnlockAddonName)
+
+            // The payload travels whole. Same three names either way; the Vulkan
+            // route keeps its own copy in its own folder.
+            let deepFriedFiles =
+                // One source for every route that takes it. "if Vulkan" holds
+                // the very same three files, byte for byte.
+                let folder = emulatorPayloadDirName
+
+                deepFriedFileNames
+                |> Array.map (fun n -> Path.Combine(modRoot, folder, n))
             let feedAddonFile = Path.Combine(modRoot, feedAddonName)
             let feedAddon32File = Path.Combine(modRoot, feedAddon32Name)
             let host64Dir = Path.Combine(modRoot, bit32PayloadDirName, host64DirName)
@@ -2014,9 +2817,19 @@ module ModInstaller =
             let missing =
                 [ yield setupExe
                   if is32Bit then
+                      // The payload is deliberately absent from this list. It
+                      // is an optional extra on this route, and refusing the
+                      // whole install because one of its three files is missing
+                      // would stop a perfectly good DX9 32-bit setup from ever
+                      // starting. What is there is copied; what is not is
+                      // skipped, and the summary says which.
                       yield feedAddon32File
                   else
-                      yield addonFile
+                      // Vulkan with the payload switched off needs no RenoDX
+                      // either - it is a DirectX add-on and never loads there.
+                      if deepFriedWanted then yield! deepFriedFiles
+                      elif not vulkanRoute then yield addonFile
+
                       yield feedAddonFile
                       yield dlssnrFile
 
@@ -2044,7 +2857,12 @@ module ModInstaller =
 
             // DX9 titles get ReShade on the d3d9 slot, because that is the only
             // one the game itself loads. It does not stay there - see step 1a.
-            let api = if isDx9 then "d3d9" else detectReShadeApi exePath
+            // The Vulkan route says so outright rather than asking the folder:
+            // that is the whole point of choosing it.
+            let api =
+                if isDx9 then "d3d9"
+                elif vulkanRoute then "vulkan"
+                else detectReShadeApi exePath
             report (sprintf "Installing ReShade runtime (%s)..." api) 0.10
 
             let reshadeDll = Path.Combine(exeDir, api + ".dll")
@@ -2058,6 +2876,7 @@ module ModInstaller =
             let alreadyHasReShade =
                 GameAnalyzer.isReShadeInstalled exePath
                 || (isDx9 && isReShadeFile reshadeDll)
+                || priorReShade
 
             let reshadeExisted = File.Exists(reshadeDll)
 
@@ -2170,7 +2989,13 @@ module ModInstaller =
 
                     report "Installing the 64-bit host..." 0.33
                     let host64Target = Path.Combine(exeDir, host64DirName)
-                    let copied = copyTree tracker host64Dir host64Target
+
+                    // Everything in the payload except the 64-bit feed add-on.
+                    // That one is for a 64-bit game; inside the helper it only
+                    // registers and does nothing - the feed says so in its own
+                    // log ("delete host64\dlss5-feed.addon64") - and it sits
+                    // beside the neural consumer the helper actually talks to.
+                    let copied = copyTreeExcept tracker host64Dir host64Target [| feedAddonName |]
 
                     // The host needs the NVIDIA runtimes, but it no longer
                     // carries its own copies - they come from the one place
@@ -2185,12 +3010,46 @@ module ModInstaller =
                             tracker.Copy(src, Path.Combine(host64Target, name))
                             extra <- extra + 1
 
-                    copied + extra
+                    // Deep-fried chicken, in the one place a 32-bit game can
+                    // reach it. The normal DX9 32-bit install has already been
+                    // laid down above; this only adds to it.
+                    let mutable payload = 0
+
+                    if deepFriedHost64 then
+                        report "Installing the deep-fried chicken payload..." 0.36
+
+                        for src in deepFriedFiles do
+                            if File.Exists(src) then
+                                try
+                                    tracker.Copy(src, Path.Combine(host64Target, Path.GetFileName(src)))
+                                    payload <- payload + 1
+                                with _ ->
+                                    // One file that will not copy is not worth
+                                    // losing the install over; the rest of the
+                                    // route is already in place and working.
+                                    ()
+
+                    copied + extra + payload
                 else
-                    report "Installing RenoDX DLSS 5 add-on..." 0.30
-                    // The payload switch in Settings is the one RenoDX switch,
-                    // whichever build the Multipass option picked.
-                    copyIfEnabled tracker renodxAddonName addonFile (Path.Combine(exeDir, renodxName)) |> ignore
+                    if deepFriedWanted then
+                        report
+                            (if vulkanRoute then "Installing the Vulkan payload..."
+                             else "Installing the deep-fried chicken payload...")
+                            0.30
+                        // In RenoDX's place, not beside it: the whole payload
+                        // goes next to the executable and no RenoDX build does.
+                        for src in deepFriedFiles do
+                            tracker.Copy(src, Path.Combine(exeDir, Path.GetFileName(src)))
+                    elif vulkanRoute then
+                        // The payload switched off on Vulkan: nothing goes in its
+                        // place, because RenoDX cannot load on this route.
+                        ()
+                    else
+                        report "Installing RenoDX DLSS 5 add-on..." 0.30
+                        // The payload switch in Settings is the one RenoDX
+                        // switch, whichever build the Multipass option picked.
+                        copyIfEnabled tracker renodxAddonName addonFile (Path.Combine(exeDir, renodxName)) |> ignore
+
                     copyIfEnabled tracker feedAddonName feedAddonFile (Path.Combine(exeDir, feedAddonName)) |> ignore
 
                     // MFG unlock sits right beside RenoDX, next to the executable.
@@ -2263,6 +3122,7 @@ module ModInstaller =
                     match mode with
                     | Dx9 -> "DX9"
                     | Dx11 -> "DX11"
+                    | VulkanMode -> "Vulkan"
                     | _ -> "DX12"
 
                 let parts =
@@ -2289,6 +3149,14 @@ module ModInstaller =
 
                       if multipassWanted then
                           yield "Multipass build of RenoDX deployed"
+
+                      if deepFriedWanted then
+                          yield
+                              (if vulkanRoute then "Vulkan payload deployed (no RenoDX on this route)"
+                               else "Deep-fried chicken deployed in place of RenoDX")
+
+                      if deepFriedHost64 && host64Files > 0 then
+                          yield "Deep-fried chicken deployed inside host64"
 
                       if overlayFiles then
                           yield "Overlay installed"
@@ -2377,18 +3245,36 @@ module ModInstaller =
                 with _ ->
                     ""
 
+            // The copy that travels with the game folder.
+            let sidecar =
+                if String.IsNullOrWhiteSpace(targetDir) then
+                    ""
+                else
+                    Path.Combine(targetDir, installRecordName)
+
+            // AppData first - it is the one the rest of the app reads - then
+            // the copy beside the game. Before this fallback existed, a lost
+            // AppData record sent a perfectly ordinary install down the
+            // "foreign" path, which is why files kept being left behind.
+            let recordPath =
+                if File.Exists(path) then path
+                elif sidecar <> "" && File.Exists(sidecar) then sidecar
+                else ""
+
             if not (canWriteTo targetDir) then
                 // Removal restores and deletes files, so it needs the same
                 // rights the install did.
                 { Success = false; Message = elevationNeededMessage }
-            elif not (File.Exists(path)) then
+            elif recordPath = "" then
                 removeForeignInstall game exePath plan report
             else
                 report "Reading restore point..." 0.08
 
                 let options = JsonSerializerOptions()
                 options.PropertyNameCaseInsensitive <- true
-                let manifest = JsonSerializer.Deserialize<InstallManifest>(File.ReadAllText(path), options)
+
+                let manifest =
+                    JsonSerializer.Deserialize<InstallManifest>(File.ReadAllText(recordPath), options)
 
                 // An OptiScaler install unwinds itself first: the model goes,
                 // then OptiScaler's own uninstaller runs out of sight. What it
@@ -2444,7 +3330,15 @@ module ModInstaller =
                         ()
 
                 try
-                    let root = Path.GetDirectoryName(manifest.ExecutablePath)
+                    // Where the game is *now*. The manifest records where it
+                    // was at install time, which goes stale the moment the
+                    // library moves - and a stale root means every sweep below
+                    // looks in the wrong folder and quietly finds nothing.
+                    let root =
+                        if String.IsNullOrWhiteSpace(targetDir) then
+                            Path.GetDirectoryName(manifest.ExecutablePath)
+                        else
+                            targetDir
 
                     if not (String.IsNullOrWhiteSpace(root)) then
                         // Config and log files the mod wrote on its first run.
@@ -2472,6 +3366,22 @@ module ModInstaller =
 
                                 try
                                     if File.Exists(p) && not (handled.Contains(p)) then
+                                        File.Delete(p)
+                                        removed <- removed + 1
+                                with _ ->
+                                    ()
+
+                        // The effects the overlay wrote into the shader folder
+                        // while the game was running. The manifest was written
+                        // before the game ever started, so it cannot know them.
+                        for name in overlayWrittenEffects do
+                            for dir in [ Path.Combine(root, reshadeShadersDirName, "Shaders")
+                                         Path.Combine(root, reshadeShadersDirName)
+                                         root ] do
+                                let p = Path.Combine(dir, name)
+
+                                try
+                                    if File.Exists(p) then
                                         File.Delete(p)
                                         removed <- removed + 1
                                 with _ ->
@@ -2511,7 +3421,18 @@ module ModInstaller =
                 with _ ->
                     ()
 
-                File.Delete(path)
+                try
+                    File.Delete(path)
+                with _ ->
+                    ()
+
+                // The copy beside the game goes last: until this line it is the
+                // only thing that still knows an install was ever here.
+                try
+                    if sidecar <> "" && File.Exists(sidecar) then File.Delete(sidecar)
+                with _ ->
+                    ()
+
                 report "DLSS 5 removed." 1.0
 
                 { Success = true

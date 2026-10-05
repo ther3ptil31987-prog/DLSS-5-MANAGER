@@ -1,4 +1,4 @@
-namespace DLSS_5_MANAGER.ViewModels
+﻿namespace DLSS_5_MANAGER.ViewModels
 
 open System
 open System.Collections
@@ -181,6 +181,33 @@ module CommunityShared =
 
     let statusAccent (status: string) = brush (statusHex status)
     let statusTint (status: string) = tint (statusHex status) 40uy
+
+    // ---- what a person is, shown beside their name ----------------------
+    //
+    // Same shape as the route and status helpers above, for the same reason:
+    // the colours live in one place and `brush` / `tint` stay private.
+    let private roleKey (role: string) =
+        if isNull role then "" else role.Trim().ToLowerInvariant()
+
+    /// "" is an ordinary player, and they get no badge at all - one reading
+    /// "PLAYER" on every post would say nothing and cost a line.
+    let hasRole (role: string) = roleKey role <> ""
+
+    let roleText (role: string) =
+        match roleKey role with
+        | "youtuber" -> "YOUTUBER"
+        | "famous" -> "FAMOUS"
+        | other -> other.ToUpperInvariant()
+
+    let private roleHex (role: string) =
+        match roleKey role with
+        | "youtuber" -> "#FF6B6B"
+        | "famous" -> "#FCD34D"
+        | _ -> "#94A3B8"
+
+    let roleAccent (role: string) = brush (roleHex role)
+    let roleTint (role: string) = tint (roleHex role) 30uy
+    let roleEdge (role: string) = tint (roleHex role) 85uy
     let statusEdge (status: string) = tint (statusHex status) 110uy
 
     /// Marshals back to the UI thread. Every network reply lands here before it
@@ -260,11 +287,59 @@ type RouteChipViewModel(stat: CommunityApi.RouteStatDto) =
 type CommunityCommentViewModel(dto: CommunityApi.CommentDto) =
     inherit ViewModelBase()
 
+    /// The words, held rather than read from the dto: the author can fix them
+    /// in place and the reply has to follow without the feed being fetched
+    /// again.
+    let mutable body = dto.Body
+    let mutable isEditing = false
+    let mutable draft = dto.Body
+
     member _.Id = dto.Id
     member _.Author = if String.IsNullOrWhiteSpace(dto.Author) then "Anonymous" else dto.Author
-    member _.Body = dto.Body
+    member _.Body = body
     member _.Ago = CommunityShared.ago dto.Created
     member _.IsVerified = CommunityShared.isVerified dto.Author
+
+    /// Whether this machine wrote it. Compared locally against our own tag,
+    /// exactly as a report is, so the server never says who anybody is.
+    member _.IsMine =
+        not (String.IsNullOrWhiteSpace(dto.Tag)) && dto.Tag = CommunityApi.pulseTag.Value
+
+    // ---- fixing your own reply -------------------------------------------
+    //
+    // A reply is usually where the answer ends up - "I found out why it
+    // crashed" - and that is the thing people come back to add. Nothing is
+    // editable until the button is pressed: the text is text until then.
+    member _.IsEditing = isEditing
+
+    member this.Draft
+        with get () = draft
+        and set value =
+            if draft <> value then
+                draft <- (if isNull value then "" else value)
+                this.RaisePropertyChanged("Draft")
+
+    member this.BeginEdit() =
+        if not isEditing then
+            isEditing <- true
+            draft <- body
+            this.RaisePropertyChanged("IsEditing")
+            this.RaisePropertyChanged("Draft")
+
+    member this.CancelEdit() =
+        if isEditing then
+            isEditing <- false
+            draft <- body
+            this.RaisePropertyChanged("IsEditing")
+            this.RaisePropertyChanged("Draft")
+
+    member this.ApplyBody(value: string) =
+        body <- (if isNull value then "" else value)
+        isEditing <- false
+        draft <- body
+
+        for n in [ "Body"; "IsEditing"; "Draft" ] do
+            this.RaisePropertyChanged(n)
 
 
 /// One post about one game.
@@ -278,6 +353,22 @@ type CommunityReportViewModel(dto: CommunityApi.ReportDto) =
     let mutable replyText = ""
     let mutable commentCount = dto.Comments
 
+    /// The verdict, held rather than read straight from the dto: the developer
+    /// can correct it in place, and the badge has to follow without the whole
+    /// feed being fetched again.
+    let mutable status = dto.Status
+
+    /// The words, held for the same reason as the verdict: the author can fix
+    /// them in place and the card has to follow without a refetch.
+    let mutable body = dto.Body
+    let mutable isEditingBody = false
+    let mutable bodyDraft = dto.Body
+
+    /// Whether the person looking is the developer. Set by the feed as each
+    /// card is built. It only decides whether the correction buttons are drawn
+    /// - the server checks the profile again before changing anything.
+    let mutable isDevViewer = false
+
     member _.Id = dto.Id
     member _.Author = if String.IsNullOrWhiteSpace(dto.Author) then "Anonymous" else dto.Author
 
@@ -286,13 +377,79 @@ type CommunityReportViewModel(dto: CommunityApi.ReportDto) =
         if String.IsNullOrWhiteSpace(dto.Author) then "?" else dto.Author.Substring(0, 1).ToUpperInvariant()
 
     member _.Ago = CommunityShared.ago dto.Created
-    member _.Body = dto.Body
-    member _.HasBody = not (String.IsNullOrWhiteSpace(dto.Body))
+    member _.Body = body
+    member _.HasBody = not (String.IsNullOrWhiteSpace(body))
 
-    member _.StatusText = CommunityShared.statusText dto.Status
-    member _.StatusAccent = CommunityShared.statusAccent dto.Status
-    member _.StatusTint = CommunityShared.statusTint dto.Status
-    member _.StatusEdge = CommunityShared.statusEdge dto.Status
+    // ---- fixing your own words ------------------------------------------
+    //
+    // A report is written in a hurry, about a game that keeps changing under
+    // it: a driver, a patch, the app's own next version. The verdict could
+    // always be corrected; the words could not, which is what people meant
+    // when they said editing did not work.
+    member _.IsEditingBody = isEditingBody
+
+    member this.BodyDraft
+        with get () = bodyDraft
+        and set value =
+            if bodyDraft <> value then
+                bodyDraft <- (if isNull value then "" else value)
+                this.RaisePropertyChanged("BodyDraft")
+
+    member this.BeginEditBody() =
+        if not isEditingBody then
+            isEditingBody <- true
+            bodyDraft <- body
+            this.RaisePropertyChanged("IsEditingBody")
+            this.RaisePropertyChanged("BodyDraft")
+
+    member this.CancelEditBody() =
+        if isEditingBody then
+            isEditingBody <- false
+            bodyDraft <- body
+            this.RaisePropertyChanged("IsEditingBody")
+            this.RaisePropertyChanged("BodyDraft")
+
+    /// Applied once the server has taken the new words.
+    member this.ApplyBody(value: string) =
+        body <- (if isNull value then "" else value)
+        isEditingBody <- false
+        bodyDraft <- body
+
+        for n in [ "Body"; "HasBody"; "IsEditingBody"; "BodyDraft" ] do
+            this.RaisePropertyChanged(n)
+
+    member _.StatusText = CommunityShared.statusText status
+    member _.StatusAccent = CommunityShared.statusAccent status
+    member _.StatusTint = CommunityShared.statusTint status
+    member _.StatusEdge = CommunityShared.statusEdge status
+    member _.Status = status
+
+    // ---- who this person is ---------------------------------------------
+    member _.HasRole = CommunityShared.hasRole dto.Role
+    member _.RoleText = CommunityShared.roleText dto.Role
+    member _.RoleAccent = CommunityShared.roleAccent dto.Role
+    member _.RoleTint = CommunityShared.roleTint dto.Role
+    member _.RoleEdge = CommunityShared.roleEdge dto.Role
+
+    /// Whether this machine filed this report. Compared locally against our
+    /// own tag, so the server never has to say who anybody is.
+    member _.IsMine =
+        not (String.IsNullOrWhiteSpace(dto.Tag)) && dto.Tag = CommunityApi.pulseTag.Value
+
+    member this.IsDevViewer
+        with get () = isDevViewer
+        and set value =
+            if isDevViewer <> value then
+                isDevViewer <- value
+                this.RaisePropertyChanged("IsDevViewer")
+
+    /// Applied once the server has accepted the correction.
+    member this.ApplyStatus(value: string) =
+        if status <> value then
+            status <- value
+
+            for n in [ "Status"; "StatusText"; "StatusAccent"; "StatusTint"; "StatusEdge" ] do
+                this.RaisePropertyChanged(n)
     member _.RouteLabel = CommunityShared.routeLabel dto.Route dto.Api dto.Arch
     member _.RouteAccent = CommunityShared.routeAccent dto.Route
     member _.RouteTint = CommunityShared.routeTint dto.Route
@@ -316,6 +473,21 @@ type CommunityReportViewModel(dto: CommunityApi.ReportDto) =
     member _.HasRam = not (String.IsNullOrWhiteSpace(dto.Ram))
     member _.IsVerified = CommunityShared.isVerified dto.Author
     member _.HasVersion = not (String.IsNullOrWhiteSpace(dto.Version))
+
+    /// The rest of the machine is folded away behind one small button.
+    ///
+    /// Six chips in one line - "AMD Ryzen 7 9800X3D 8-Core Processor" beside
+    /// "Windows 11 Home - 25H2 - 64-bit - 26200" - ran straight off the edge of
+    /// the card and under the scrollbar. The card now carries only what people
+    /// actually compare, and the rest lays out as a tidy list on request.
+    member this.HasMoreSpecs =
+        this.HasDriver || this.HasCpu || this.HasRam || this.HasOs || this.HasVersion
+
+    member val IsSpecsOpen = false with get, set
+
+    member this.ToggleSpecs() =
+        this.IsSpecsOpen <- not this.IsSpecsOpen
+        this.RaisePropertyChanged("IsSpecsOpen")
 
     member _.Emoji1 = CommunityApi.reactionEmoji.[0]
     member _.Emoji2 = CommunityApi.reactionEmoji.[1]
@@ -458,6 +630,9 @@ type CommunityViewModel() =
     /// Twenty at a time. The whole list arriving at once is what made entering
     /// the section expensive; the rest follows as the user scrolls.
     let pageSize = 20
+
+    /// Pages in a row that failed. Reset by any page that arrives.
+    let mutable failedPages = 0
     let mutable hasMore = false
     let mutable isLoadingMore = false
 
@@ -481,6 +656,19 @@ type CommunityViewModel() =
     let mutable sheetTitle = ""
     let mutable sheetGameId = ""
     let mutable sheetRouteFilter = ""
+
+    /// The developer's pinned advice for the open game, the draft while it is
+    /// being written, and whether the editor is showing. The note travels on
+    /// the game row itself, so a sheet has it the moment it opens and nothing
+    /// is fetched to put it on screen.
+    let mutable sheetNote = ""
+    let mutable sheetNoteDraft = ""
+    let mutable isNoteEditorOpen = false
+
+    /// True only on the developer's own device, as the server reports it. All
+    /// it does is offer the editor - the server checks again on the way in, so
+    /// this is about what the interface shows, not about access.
+    let mutable isDev = false
 
     // ---- the composer ----------------------------------------------------
     let mutable isComposerOpen = false
@@ -558,12 +746,22 @@ type CommunityViewModel() =
                 match CommunityApi.claimName wanted with
                 | Error e -> Error e
                 | Ok confirmed ->
+                    // Typing the developer sentence is how a machine becomes the
+                    // developer, and only the server knows whether it worked -
+                    // so the flag is re-read here rather than staying false
+                    // until the next launch, which is when the pin editor would
+                    // otherwise appear. Already off the UI thread inside `Run`.
+                    let dev =
+                        CommunityApi.getMe () |> Result.map snd |> Result.defaultValue isDev
+
                     ui (fun () ->
                         displayName <- confirmed
+                        isDev <- dev
                         statusMessage <- ""
                         this.RaisePropertyChanged("DisplayName")
                         this.RaisePropertyChanged("IsNamed")
                         this.RaisePropertyChanged("IsAnonymous")
+                        this.RaisePropertyChanged("IsDev")
                         this.RaisePropertyChanged("HasStatusMessage")
                         this.RaisePropertyChanged("StatusMessage"))
 
@@ -696,6 +894,42 @@ type CommunityViewModel() =
               "IsFirstLoad"; "ShowNothingFound"; "HasMore"; "IsLoadingMore" ] do
             this.RaisePropertyChanged(name)
 
+        this.PrewarmFeeds(list)
+
+    /// Fetches the reports for the games that just arrived, in the background,
+    /// into the same cache the sheet reads.
+    ///
+    /// Opening a game used to mean waiting for a round trip with nothing on
+    /// screen. The grid is already a page of games somebody is about to open
+    /// one of, so the answers are fetched while they are still reading the
+    /// grid and the sheet finds them waiting.
+    ///
+    /// Only for someone who has a name here - they are the ones who read and
+    /// write reports, and it is their session that pays for the requests.
+    /// One at a time with a pause between, only for games not already held,
+    /// and only the first page's worth: this is a head start, not a crawl of
+    /// the whole community.
+    member private this.PrewarmFeeds(list: CommunityApi.GameDto[]) =
+        if not (String.IsNullOrWhiteSpace(displayName)) && list.Length > 0 then
+            let wanted =
+                list
+                |> Array.filter (fun g -> not (isNull g.Id) && g.Reports > 0)
+                |> Array.truncate 12
+                |> Array.map (fun g -> g.Id)
+
+            if wanted.Length > 0 then
+                Task.Run(fun () ->
+                    for id in wanted do
+                        // Whoever got there first - the user opening the game,
+                        // or an earlier pass - has already put it in the cache.
+                        if (CommunityShared.cachedFeed id).IsNone then
+                            match (try CommunityApi.listFeed id "" with _ -> Error "") with
+                            | Ok(reports, routes) -> CommunityShared.rememberFeed id reports routes
+                            | Error _ -> ()
+
+                            System.Threading.Thread.Sleep(120))
+                |> ignore
+
     /// Fills the grid, from memory when the same filters were asked for in the
     /// last few minutes. Returns true when it answered without going out, which
     /// is what makes coming back to the section instant.
@@ -764,6 +998,7 @@ type CommunityViewModel() =
 
                     match outcome with
                     | Ok(list, total, next) ->
+                        failedPages <- 0
                         this.AddPage(list, total, next, false)
 
                         // Everything held so far, so coming back to the section
@@ -771,10 +1006,20 @@ type CommunityViewModel() =
                         let held = games |> Seq.map (fun g -> g.Dto) |> Seq.toArray
                         this.Remember(key, held, total, next)
                     | Error _ ->
-                        // A page that fails is not worth a banner: the grid
-                        // stops growing and scrolling again retries it.
-                        hasMore <- false
-                        this.RaisePropertyChanged("HasMore")
+                        // A page that fails is retried - a little later each
+                        // time, and a few times at most. It used to switch the
+                        // grid off for good on the first failure, despite what
+                        // this comment then said, so one hiccup on a fresh
+                        // device - where nothing is cached yet - left the grid
+                        // stuck at its first twenty games.
+                        failedPages <- failedPages + 1
+
+                        if failedPages >= 4 then
+                            hasMore <- false
+                            this.RaisePropertyChanged("HasMore")
+                        else
+                            Task.Delay(1500 * failedPages).ContinueWith(fun (_: Task) -> ui (fun () -> this.LoadMore()))
+                            |> ignore
 
                     this.RaisePropertyChanged("IsLoadingMore")))
             |> ignore
@@ -788,13 +1033,17 @@ type CommunityViewModel() =
             let key = this.GridKey
 
             this.Run(fun () ->
-                let name = CommunityApi.getMyName () |> Result.defaultValue ""
+                // One call answers both: the name this device posts under, and
+                // whether it is the developer's - which is what offers the pin.
+                let (name, dev) = CommunityApi.getMe () |> Result.defaultValue ("", false)
 
                 ui (fun () ->
                     displayName <- name
+                    isDev <- dev
                     this.RaisePropertyChanged("DisplayName")
                     this.RaisePropertyChanged("IsNamed")
-                    this.RaisePropertyChanged("IsAnonymous"))
+                    this.RaisePropertyChanged("IsAnonymous")
+                    this.RaisePropertyChanged("IsDev"))
 
                 match CommunityApi.listGamesPage query routeFilter resultFilter sortOrder "" pageSize with
                 | Error e -> Error e
@@ -817,6 +1066,52 @@ type CommunityViewModel() =
     member _.RouteChips = routeChips
     member _.HasRouteChips = routeChips.Count > 0
 
+    // ---- the pinned note -------------------------------------------------
+    member _.SheetNote = sheetNote
+    member _.HasSheetNote = not (String.IsNullOrWhiteSpace(sheetNote))
+    member _.IsDev = isDev
+    member _.IsNoteEditorOpen = isNoteEditorOpen
+
+    member this.SheetNoteDraft
+        with get () = sheetNoteDraft
+        and set value = this.SetProperty(&sheetNoteDraft, value) |> ignore
+
+    /// Opens the editor on whatever is pinned now, so an edit starts from the
+    /// existing line instead of from an empty box.
+    member this.OpenNoteEditor() =
+        sheetNoteDraft <- sheetNote
+        isNoteEditorOpen <- true
+        this.RaisePropertyChanged("SheetNoteDraft")
+        this.RaisePropertyChanged("IsNoteEditorOpen")
+
+    member this.CloseNoteEditor() =
+        isNoteEditorOpen <- false
+        this.RaisePropertyChanged("IsNoteEditorOpen")
+
+    /// Pins the line, or takes the pin down when it is left empty. The server
+    /// allows this for the developer's profile only.
+    member this.SaveSheetNote() =
+        let id = sheetGameId
+        let text = (if isNull sheetNoteDraft then "" else sheetNoteDraft).Trim()
+
+        if not (String.IsNullOrWhiteSpace(id)) then
+            this.Run(fun () ->
+                match CommunityApi.setGameNote id text with
+                | Error e -> Error e
+                | Ok() ->
+                    // The note rides on every cached game row, so anything held
+                    // would keep showing the line that was just replaced.
+                    CommunityShared.dropCaches ()
+
+                    ui (fun () ->
+                        sheetNote <- text
+                        isNoteEditorOpen <- false
+                        this.RaisePropertyChanged("SheetNote")
+                        this.RaisePropertyChanged("HasSheetNote")
+                        this.RaisePropertyChanged("IsNoteEditorOpen"))
+
+                    Ok())
+
     member this.OpenGame(game: CommunityGameViewModel) =
         sheetGameId <- game.Id
         sheetTitle <- game.Title
@@ -824,9 +1119,18 @@ type CommunityViewModel() =
         isSheetOpen <- true
         reports.Clear()
 
+        // The pin came with the game row, so it is on screen the moment the
+        // sheet opens - there is nothing to wait for. A server too old to send
+        // one answers with null, which reads as "nothing pinned".
+        sheetNote <- (if isNull game.Dto.Note then "" else game.Dto.Note)
+        isNoteEditorOpen <- false
+
         this.RaisePropertyChanged("IsSheetOpen")
         this.RaisePropertyChanged("SheetTitle")
         this.RaisePropertyChanged("HasReports")
+        this.RaisePropertyChanged("SheetNote")
+        this.RaisePropertyChanged("HasSheetNote")
+        this.RaisePropertyChanged("IsNoteEditorOpen")
         this.LoadReports()
 
     member this.CloseSheet() =
@@ -854,7 +1158,10 @@ type CommunityViewModel() =
         reports.Clear()
 
         for r in list do
-            reports.Add(CommunityReportViewModel(r))
+            let card = CommunityReportViewModel(r)
+            // Only the developer's own device is offered the correction buttons.
+            card.IsDevViewer <- isDev
+            reports.Add(card)
 
         this.RaisePropertyChanged("HasRouteChips")
         this.RaisePropertyChanged("HasReports")
@@ -877,6 +1184,100 @@ type CommunityViewModel() =
                 | Ok(list, stats) ->
                     CommunityShared.rememberFeed key list stats
                     ui (fun () -> this.ShowFeed(list, stats))
+                    Ok())
+
+    /// The developer correcting one verdict - someone posted "did not work" and
+    /// then said in the replies that it works after all, so the tally is saying
+    /// the opposite of what happened.
+    ///
+    /// Nothing is deleted: the post, its author and its replies stay exactly
+    /// where they are, and only the verdict moves.
+    member this.CorrectStatus(report: CommunityReportViewModel, status: string) =
+        if isDev && report.Status <> status then
+            this.Run(fun () ->
+                match CommunityApi.setReportStatus report.Id status with
+                | Error e -> Error e
+                | Ok() ->
+                    // The game's tally changed with it, so nothing held is
+                    // trusted afterwards.
+                    CommunityShared.dropCaches ()
+                    ui (fun () -> report.ApplyStatus(status))
+                    Ok())
+
+    /// The author changing their own verdict, with no time limit.
+    ///
+    /// Hardware changes and drivers change; the person who filed the report is
+    /// the one who knows. The server still refuses to let a report with no
+    /// specs attached become a "did not work" one, which is the same condition
+    /// it applied when the report was posted.
+    member this.EditOwnStatus(report: CommunityReportViewModel, status: string) =
+        if report.IsMine && report.Status <> status then
+            this.Run(fun () ->
+                match CommunityApi.editOwnReport report.Id status with
+                | Error e -> Error e
+                | Ok() ->
+                    CommunityShared.dropCaches ()
+                    ui (fun () -> report.ApplyStatus(status))
+                    Ok())
+
+    /// The author fixing the words of their own report. The verdict rides
+    /// along unchanged - the server takes both in one request.
+    member this.SaveOwnBody(report: CommunityReportViewModel) =
+        let text = if isNull report.BodyDraft then "" else report.BodyDraft.Trim()
+
+        if not report.IsMine then ()
+        elif text = report.Body then report.CancelEditBody()
+        else
+            this.Run(fun () ->
+                match CommunityApi.editOwnReportBody report.Id report.Status text with
+                | Error e -> Error e
+                | Ok saved ->
+                    CommunityShared.dropCaches ()
+                    ui (fun () -> report.ApplyBody(saved))
+                    Ok())
+
+    /// The developer saying they have run this game themselves and it works.
+    /// It pins the verdict on the game, above whatever the reports add up to.
+    member this.MarkGameTestedByDev() =
+        if isDev && sheetGameId <> "" then
+            this.Run(fun () ->
+                match CommunityApi.setGameVerdict sheetGameId "working" with
+                | Error e -> Error e
+                | Ok() ->
+                    CommunityShared.dropCaches ()
+                    ui (fun () -> this.LoadReports())
+                    Ok())
+
+    /// The author fixing the words of their own reply.
+    member this.SaveOwnComment(comment: CommunityCommentViewModel) =
+        let text = if isNull comment.Draft then "" else comment.Draft.Trim()
+
+        if not comment.IsMine then ()
+        elif text = "" then this.Run(fun () -> Error "A reply cannot be left empty.")
+        elif text = comment.Body then comment.CancelEdit()
+        else
+            this.Run(fun () ->
+                match CommunityApi.editOwnComment comment.Id text with
+                | Error e -> Error e
+                | Ok saved ->
+                    CommunityShared.dropCaches ()
+                    ui (fun () -> comment.ApplyBody(saved))
+                    Ok())
+
+    /// The developer removing a report outright - for what a correction cannot
+    /// fix. The row goes from the list the moment the server confirms it.
+    member this.RemoveReport(report: CommunityReportViewModel) =
+        if isDev then
+            this.Run(fun () ->
+                match CommunityApi.deleteReport report.Id with
+                | Error e -> Error e
+                | Ok() ->
+                    CommunityShared.dropCaches ()
+
+                    ui (fun () ->
+                        reports.Remove(report) |> ignore
+                        this.RaisePropertyChanged("HasReports"))
+
                     Ok())
 
     // ======================================================================
@@ -1044,7 +1445,18 @@ type CommunityViewModel() =
         this.RaisePropertyChanged("IsComposerOpen")
 
     member this.SubmitReport() =
-        if this.IsNamed && not (String.IsNullOrWhiteSpace(composeTitle)) then
+        // A "did not work" verdict has to carry the machine it did not work on.
+        // Saying a game works still needs nothing attached: this only asks for
+        // evidence from the reports that count against a title, which is the
+        // half that was being used to make games look broken. The server holds
+        // the same line, so bypassing the app changes nothing.
+        if composeStatus = "broken" && specs.IsNone then
+            statusMessage <-
+                "Press Detect first - a report that the game did not work has to say which machine it did not work on."
+
+            this.RaisePropertyChanged("StatusMessage")
+            this.RaisePropertyChanged("HasStatusMessage")
+        elif this.IsNamed && not (String.IsNullOrWhiteSpace(composeTitle)) then
             let draft: CommunityApi.ReportDraft =
                 { Title = composeTitle
                   SteamAppId = composeSteamId

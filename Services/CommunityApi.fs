@@ -1,4 +1,4 @@
-namespace DLSS_5_MANAGER.Services
+﻿namespace DLSS_5_MANAGER.Services
 
 open System
 open System.Net.Http
@@ -27,11 +27,11 @@ open Microsoft.Win32
 module CommunityApi =
 
     [<Literal>]
-    let BaseUrl = "https://dlss5manager-community-api.gtagatgta9.workers.dev"
+    let BaseUrl = "I am granting you access to use the application, but I am not granting you the right to use the servers linked to the community"
 
     /// Must match `wrangler secret put APP_SECRET` on the Worker.
     [<Literal>]
-    let AppSecret = "BRO-THIS-NOT-PUBLIC"
+    let AppSecret = "As stated, it is a secret that cannot be disclosed; I am granting you access to use the application, but I am not granting you the right to use the servers linked to the community."
 
     [<Literal>]
     let TutorialsUrl = "https://dlss5manager.app/tutorials"
@@ -53,6 +53,13 @@ module CommunityApi =
           [<JsonPropertyName("reports")>] Reports: int
           [<JsonPropertyName("comments")>] Comments: int
           [<JsonPropertyName("verdict")>] Verdict: string
+          /// Whether that verdict is the developer's own, pinned after they
+          /// ran the game themselves. Older servers leave it false.
+          [<JsonPropertyName("dev_tested")>] DevTested: bool
+          /// The developer's pinned advice for this game, "" when there is
+          /// none. It comes with the grid, so opening a game costs nothing
+          /// extra to show it.
+          [<JsonPropertyName("note")>] Note: string
           [<JsonPropertyName("updated")>] Updated: int64 }
 
     [<CLIMutable>]
@@ -67,6 +74,15 @@ module CommunityApi =
     type ReportDto =
         { [<JsonPropertyName("id")>] Id: string
           [<JsonPropertyName("author")>] Author: string
+          /// A one-way tag of the author's device - the same one the chat
+          /// carries. The app compares it with its own to know which reports
+          /// belong to this machine. A plain "mine" flag could not work: this
+          /// response is cached at the edge and handed to everybody.
+          [<JsonPropertyName("tag")>] Tag: string
+          /// What this person is: "" for an ordinary player, else "youtuber"
+          /// or "famous". Read from their profile, so it is current rather
+          /// than whatever was true when they posted.
+          [<JsonPropertyName("role")>] Role: string
           [<JsonPropertyName("status")>] Status: string
           [<JsonPropertyName("route")>] Route: string
           [<JsonPropertyName("api")>] Api: string
@@ -90,6 +106,10 @@ module CommunityApi =
         { [<JsonPropertyName("id")>] Id: string
           [<JsonPropertyName("author")>] Author: string
           [<JsonPropertyName("body")>] Body: string
+          /// The one-way tag of the device that wrote it, matched against our
+          /// own so the app knows which replies it may offer to edit. Older
+          /// servers leave it null, and then nothing is offered.
+          [<JsonPropertyName("tag")>] Tag: string
           [<JsonPropertyName("created")>] Created: int64 }
 
     [<CLIMutable>]
@@ -123,7 +143,11 @@ module CommunityApi =
         { [<JsonPropertyName("ok")>] Ok: bool
           [<JsonPropertyName("error")>] Error: string
           [<JsonPropertyName("name")>] Name: string
-          [<JsonPropertyName("on")>] On: bool }
+          [<JsonPropertyName("on")>] On: bool
+          /// True only for the developer's own profile. It decides whether the
+          /// app offers the pinned-note editor; the server checks it again on
+          /// the way in, so it is a hint to the interface, not permission.
+          [<JsonPropertyName("dev")>] Dev: bool }
 
     /// What the composer sends. Named to match the Worker's field names.
     type ReportDraft =
@@ -169,11 +193,63 @@ module CommunityApi =
     // -----------------------------------------------------------------------
     // TRANSPORT
     // -----------------------------------------------------------------------
+    /// TLS 1.2 and 1.3 by name. Left to the default, .NET asks the machine,
+    /// and a machine whose registry was "hardened" by some tweak tool or an old
+    /// security suite can answer with nothing Cloudflare accepts - which is
+    /// one of the ways "The SSL connection could not be established" happens.
     let private client =
         lazy
-            (let c = new HttpClient()
+            (let handler = new SocketsHttpHandler()
+             handler.SslOptions.EnabledSslProtocols <-
+                 System.Security.Authentication.SslProtocols.Tls12
+                 ||| System.Security.Authentication.SslProtocols.Tls13
+             handler.ConnectTimeout <- TimeSpan.FromSeconds(12.0)
+
+             let c = new HttpClient(handler)
              c.Timeout <- TimeSpan.FromSeconds(20.0)
              c)
+
+    /// Turns a failed request into something a person can act on.
+    ///
+    /// .NET reports every TLS failure as "The SSL connection could not be
+    /// established, see inner exception" - and nobody can see the inner
+    /// exception. The real reason is always one of a few, and each has a
+    /// different fix, so the chain is walked and the likely one named.
+    let describeFailure (ex: exn) : string =
+        let rec chain (e: exn) =
+            [ if not (isNull e) then
+                  yield e
+                  yield! chain e.InnerException ]
+
+        let all = chain ex
+        let text = all |> List.map (fun e -> e.Message) |> String.concat " | "
+        let has (word: string) = text.IndexOf(word, StringComparison.OrdinalIgnoreCase) >= 0
+
+        // A clock that is days out makes every certificate look expired or not
+        // yet valid - by far the commonest cause on a second machine.
+        let clockIsOff =
+            try
+                let year = DateTime.UtcNow.Year
+                year < 2025 || year > 2035
+            with _ ->
+                false
+
+        if all |> List.exists (fun e -> e :? System.Security.Authentication.AuthenticationException)
+           || has "SSL" || has "certificate" then
+            if clockIsOff || has "NotTimeValid" || has "expired" then
+                "Secure connection refused: this PC's date and time look wrong. Set them to automatic in Windows settings, then try again."
+            elif has "RemoteCertificateChainErrors" || has "UntrustedRoot" || has "PartialChain" then
+                "Secure connection refused: something on this PC is intercepting HTTPS (usually antivirus \"web shield\" or a proxy). Allow DLSS 5 MANAGER in it, or turn that feature off, then try again."
+            else
+                "Secure connection could not be made. If this keeps happening: check the PC's date and time, pause antivirus web protection, and try another network or a VPN - some providers block this server. ("
+                + (all |> List.last).Message
+                + ")"
+        elif has "No such host" || has "name or service" || has "nodename" then
+            "The community server could not be found. Check your internet connection."
+        elif has "forcibly closed" || has "reset" || has "refused" then
+            "The connection was cut off before the server answered. Your network or a firewall may be blocking it - try another network or a VPN."
+        else
+            (all |> List.last).Message
 
     let private jsonOptions =
         let o = JsonSerializerOptions()
@@ -239,7 +315,7 @@ module CommunityApi =
                 Error message
         with
         | :? TaskCanceledException -> Error "The server did not answer in time."
-        | ex -> Error ex.Message
+        | ex -> Error(describeFailure ex)
 
     let private escape (s: string) =
         JsonEncodedText.Encode(if isNull s then "" else s).ToString()
@@ -248,10 +324,13 @@ module CommunityApi =
     // ENDPOINTS
     // -----------------------------------------------------------------------
 
-    /// The display name this device already claimed, or "" for a first visit.
-    let getMyName () : Result<string, string> =
+    /// The display name this device already claimed - "" for a first visit -
+    /// and whether it carries the developer profile, which is what offers the
+    /// pinned-note editor. One request answers both, so entering the section
+    /// still costs the single call it always did.
+    let getMe () : Result<string * bool, string> =
         send<SimpleResponse> HttpMethod.Get "/v1/me" ""
-        |> Result.map (fun r -> if isNull r.Name then "" else r.Name)
+        |> Result.map (fun r -> (if isNull r.Name then "" else r.Name), r.Dev)
 
     let claimName (name: string) : Result<string, string> =
         let body = sprintf "{\"name\":\"%s\"}" (escape name)
@@ -326,6 +405,22 @@ module CommunityApi =
     let postComment (reportId: string) (text: string) : Result<unit, string> =
         let body = sprintf "{\"report_id\":\"%s\",\"body\":\"%s\"}" (escape reportId) (escape text)
         send<SimpleResponse> HttpMethod.Post "/v1/comments" body |> Result.map ignore
+
+    /// Pins a line of advice above a game's reports, or clears it when `note`
+    /// is empty. The server refuses this for anyone but the developer, so the
+    /// worst a tampered client achieves is a 403.
+    let setGameNote (gameId: string) (note: string) : Result<unit, string> =
+        let body = sprintf "{\"game_id\":\"%s\",\"note\":\"%s\"}" (escape gameId) (escape note)
+        send<SimpleResponse> HttpMethod.Post "/v1/games/note" body |> Result.map ignore
+
+    /// Corrects one report's verdict - "working", "mixed" or "broken".
+    ///
+    /// The post, its author and its replies all stay; only the verdict moves,
+    /// so the correction is visible rather than hidden. The server allows this
+    /// for the developer's profile only.
+    let setReportStatus (reportId: string) (status: string) : Result<unit, string> =
+        let body = sprintf "{\"report_id\":\"%s\",\"status\":\"%s\"}" (escape reportId) (escape status)
+        send<SimpleResponse> HttpMethod.Post "/v1/reports/status" body |> Result.map ignore
 
     /// Tapping the same emoji twice takes the reaction back; the reply says
     /// which way it went so the button can light up without a refetch.
@@ -432,6 +527,9 @@ module CommunityApi =
           /// fingerprint. See `pulseTag`.
           [<JsonPropertyName("tag")>] Tag: string
           [<JsonPropertyName("dev")>] Dev: bool
+          /// What this person is: "" for an ordinary player, else "youtuber"
+          /// or "famous". Shown as a badge beside the name, next to DEV.
+          [<JsonPropertyName("role")>] Role: string
           [<JsonPropertyName("body")>] Body: string
           [<JsonPropertyName("image")>] Image: string
           [<JsonPropertyName("w")>] W: int
@@ -445,7 +543,11 @@ module CommunityApi =
     [<CLIMutable>]
     type ChatUpdateDto =
         { [<JsonPropertyName("id")>] Id: int64
-          [<JsonPropertyName("rx")>] Rx: ChatReactionDto[] }
+          [<JsonPropertyName("rx")>] Rx: ChatReactionDto[]
+          /// The message text as it stands now. An edit rides this same
+          /// channel, so a bubble corrected elsewhere updates in place instead
+          /// of waiting for a refetch. Older servers leave it null.
+          [<JsonPropertyName("body")>] Body: string }
 
     [<CLIMutable>]
     type ChatResponse =
@@ -574,10 +676,254 @@ module CommunityApi =
                 Error(errorOf res text)
         with
         | :? TaskCanceledException -> Error "The upload did not finish in time."
-        | ex -> Error ex.Message
+        | ex -> Error(describeFailure ex)
+
+    // -----------------------------------------------------------------------
+    // THE GALLERY
+    //
+    // A moderated picture wall beside the chat. Anyone may upload; nothing is
+    // public until the developer approves it. Pictures live in the same R2
+    // bucket under the same key space, so `getChatImage` below fetches these
+    // too and the disk cache is shared - a picture promoted out of the chat is
+    // already on disk and never downloaded twice.
+    // -----------------------------------------------------------------------
+
+    [<CLIMutable>]
+    type GalleryItemDto =
+        { [<JsonPropertyName("id")>] Id: string
+          [<JsonPropertyName("author")>] Author: string
+          /// "" for an ordinary player, else "youtuber" or "famous".
+          [<JsonPropertyName("role")>] Role: string
+          [<JsonPropertyName("image")>] Image: string
+          [<JsonPropertyName("w")>] W: int
+          [<JsonPropertyName("h")>] H: int
+          [<JsonPropertyName("caption")>] Caption: string
+          [<JsonPropertyName("game")>] Game: string
+          /// pending | approved | rejected. Only approved ones are public.
+          [<JsonPropertyName("state")>] State: string
+          [<JsonPropertyName("source")>] Source: string
+          [<JsonPropertyName("created")>] Created: int64 }
+
+    [<CLIMutable>]
+    type GalleryResponse =
+        { [<JsonPropertyName("ok")>] Ok: bool
+          [<JsonPropertyName("error")>] Error: string
+          [<JsonPropertyName("items")>] Items: GalleryItemDto[] }
+
+    let private galleryItems (r: GalleryResponse) =
+        if isNull (box r.Items) then [||] else r.Items
+
+    /// The wall itself: approved pictures, newest first.
+    let listGallery (limit: int) : Result<GalleryItemDto[], string> =
+        send<GalleryResponse> HttpMethod.Get (sprintf "/v1/gallery?limit=%d" (max 1 (min 100 limit))) ""
+        |> Result.map galleryItems
+
+    /// What is waiting for a decision. The server refuses this to everyone but
+    /// the developer, so the app only asks when it believes it is one.
+    let listGalleryPending () : Result<GalleryItemDto[], string> =
+        send<GalleryResponse> HttpMethod.Get "/v1/gallery/pending" ""
+        |> Result.map galleryItems
+
+    /// Sends an already-encoded WebP straight into the moderation queue.
+    ///
+    /// The caption and game ride in the query string rather than a JSON body:
+    /// the body is the raw picture, and the signature covers the path with its
+    /// query, so they are authenticated exactly as a JSON field would be.
+    let uploadGalleryImage
+        (webp: byte[])
+        (width: int)
+        (height: int)
+        (caption: string)
+        (game: string)
+        : Result<unit, string> =
+        try
+            let path =
+                sprintf
+                    "/v1/gallery/image?w=%d&h=%d&caption=%s&game=%s"
+                    (max 0 width)
+                    (max 0 height)
+                    (Uri.EscapeDataString(if isNull caption then "" else caption))
+                    (Uri.EscapeDataString(if isNull game then "" else game))
+
+            use req = signedRequest HttpMethod.Post path (sha256OfBytes webp)
+            let content = new ByteArrayContent(webp)
+            content.Headers.ContentType <- Headers.MediaTypeHeaderValue("image/webp")
+            req.Content <- content
+
+            use res = client.Value.Send(req)
+            let text = res.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+
+            if res.IsSuccessStatusCode then Ok() else Error(errorOf res text)
+        with
+        | :? TaskCanceledException -> Error "The upload did not finish in time."
+        | ex -> Error(describeFailure ex)
+
+    /// Developer only: `state` is "approved" or "rejected". Rejecting deletes
+    /// the picture but keeps the record, so the same one cannot be pushed
+    /// through again on a loop.
+    let decideGallery (id: string) (state: string) : Result<unit, string> =
+        send<SimpleResponse>
+            HttpMethod.Post
+            "/v1/gallery/decide"
+            (sprintf "{\"id\":\"%s\",\"state\":\"%s\"}" (escape id) (escape state))
+        |> Result.map ignore
+
+    /// Developer only: copies a picture out of the chat onto the wall, already
+    /// approved - the developer is the moderator, so nothing is left to approve.
+    let promoteChatImage (chatId: int64) (caption: string) : Result<unit, string> =
+        send<SimpleResponse>
+            HttpMethod.Post
+            "/v1/gallery/promote"
+            (sprintf "{\"chat_id\":%d,\"caption\":\"%s\"}" (max 0L chatId) (escape caption))
+        |> Result.map ignore
 
     /// The bytes of one chat image. Callers keep a disk copy - an image never
     /// changes under its key, so it is fetched from here once, ever.
+    // -----------------------------------------------------------------------
+    // SECOND THOUGHTS
+    // -----------------------------------------------------------------------
+
+    /// How long the app offers an Edit link on your own message. The server
+    /// enforces the same minute; this only decides what is drawn.
+    [<Literal>]
+    let ChatEditSeconds = 2592000L
+
+    /// Fixes the wording of your own message. The server refuses after a
+    /// minute, and refuses to empty a message that carries no picture.
+    let editChat (id: int64) (body: string) : Result<string, string> =
+        send<SimpleResponse> HttpMethod.Post "/v1/chat/edit" (sprintf "{\"id\":%d,\"body\":\"%s\"}" id (escape body))
+        |> Result.map (fun _ -> body)
+
+    /// Changes your own verdict on a game, at any time. Calling a game broken
+    /// still needs the specs it broke on, so a report filed without them is
+    /// refused here exactly as it would have been when it was posted.
+    let editOwnReport (reportId: string) (status: string) : Result<unit, string> =
+        send<SimpleResponse>
+            HttpMethod.Post
+            "/v1/reports/mine"
+            (sprintf "{\"report_id\":\"%s\",\"status\":\"%s\"}" (escape reportId) (escape status))
+        |> Result.map ignore
+
+    /// Fixing the words of your own report, at any time. The same endpoint as
+    /// the verdict, which is why the verdict travels with it: the server takes
+    /// them together and leaves whichever is not sent alone. There is no time
+    /// limit here - a report is about a game that keeps changing under it.
+    let editOwnReportBody (reportId: string) (status: string) (body: string) : Result<string, string> =
+        send<SimpleResponse>
+            HttpMethod.Post
+            "/v1/reports/mine"
+            (sprintf
+                "{\"report_id\":\"%s\",\"status\":\"%s\",\"body\":\"%s\"}"
+                (escape reportId)
+                (escape status)
+                (escape body))
+        |> Result.map (fun _ -> body)
+
+    /// Fixing the words of your own reply, at any time.
+    let editOwnComment (commentId: string) (body: string) : Result<string, string> =
+        send<SimpleResponse>
+            HttpMethod.Post
+            "/v1/comments/mine"
+            (sprintf "{\"comment_id\":\"%s\",\"body\":\"%s\"}" (escape commentId) (escape body))
+        |> Result.map (fun _ -> body)
+
+    /// Developer only: pins a verdict on a game, whatever its reports add up
+    /// to. An empty verdict takes the pin off and the counted one stands again.
+    let setGameVerdict (gameId: string) (verdict: string) : Result<unit, string> =
+        send<SimpleResponse>
+            HttpMethod.Post
+            "/v1/games/verdict"
+            (sprintf "{\"game_id\":\"%s\",\"verdict\":\"%s\"}" (escape gameId) (escape verdict))
+        |> Result.map ignore
+
+    /// Developer only: removes a report, its replies and its reactions, then
+    /// rebuilds the game's tally from what is left.
+    let deleteReport (reportId: string) : Result<unit, string> =
+        send<SimpleResponse> HttpMethod.Post "/v1/reports/remove" (sprintf "{\"report_id\":\"%s\"}" (escape reportId))
+        |> Result.map ignore
+
+    // -----------------------------------------------------------------------
+    // THE PRIVATE CHAT
+    //
+    // One thread per person with the developer at the far end. A player only
+    // ever sees their own; the developer sees every one of them. Pictures go
+    // through `uploadChatImage` above - same bucket, same key space, so the
+    // storage cap already accounts for them.
+    // -----------------------------------------------------------------------
+
+    [<CLIMutable>]
+    type DmMessageDto =
+        { [<JsonPropertyName("id")>] Id: int64
+          [<JsonPropertyName("author")>] Author: string
+          [<JsonPropertyName("role")>] Role: string
+          /// True when the developer wrote it, which is what decides the side
+          /// of the conversation the bubble is drawn on.
+          [<JsonPropertyName("dev")>] Dev: bool
+          [<JsonPropertyName("body")>] Body: string
+          [<JsonPropertyName("image")>] Image: string
+          [<JsonPropertyName("w")>] W: int
+          [<JsonPropertyName("h")>] H: int
+          [<JsonPropertyName("created")>] Created: int64 }
+
+    [<CLIMutable>]
+    type DmResponse =
+        { [<JsonPropertyName("ok")>] Ok: bool
+          [<JsonPropertyName("error")>] Error: string
+          [<JsonPropertyName("thread")>] Thread: string
+          [<JsonPropertyName("dev")>] Dev: bool
+          [<JsonPropertyName("messages")>] Messages: DmMessageDto[] }
+
+    [<CLIMutable>]
+    type DmThreadDto =
+        { [<JsonPropertyName("thread")>] Thread: string
+          [<JsonPropertyName("person")>] Person: string
+          [<JsonPropertyName("role")>] Role: string
+          /// The last line written, or "[picture]" when that was a picture.
+          [<JsonPropertyName("last")>] Last: string
+          /// True when the developer wrote last - so an unanswered thread
+          /// stands out from one already dealt with.
+          [<JsonPropertyName("mine")>] Mine: bool
+          [<JsonPropertyName("total")>] Total: int
+          [<JsonPropertyName("from_them")>] FromThem: int
+          [<JsonPropertyName("created")>] Created: int64 }
+
+    [<CLIMutable>]
+    type DmThreadsResponse =
+        { [<JsonPropertyName("ok")>] Ok: bool
+          [<JsonPropertyName("error")>] Error: string
+          [<JsonPropertyName("threads")>] Threads: DmThreadDto[] }
+
+    /// One thread. `thread` is ignored by the server for anyone but the
+    /// developer, so a player always receives their own conversation.
+    let listDm (thread: string) (afterId: int64) : Result<DmMessageDto[] * bool, string> =
+        let q =
+            sprintf
+                "/v1/dm?after=%d%s"
+                (max 0L afterId)
+                (if String.IsNullOrWhiteSpace(thread) then "" else "&thread=" + Uri.EscapeDataString(thread))
+
+        send<DmResponse> HttpMethod.Get q ""
+        |> Result.map (fun r -> (if isNull (box r.Messages) then [||] else r.Messages), r.Dev)
+
+    /// Developer only: every thread, most recently written first.
+    let listDmThreads () : Result<DmThreadDto[], string> =
+        send<DmThreadsResponse> HttpMethod.Get "/v1/dm/threads" ""
+        |> Result.map (fun r -> if isNull (box r.Threads) then [||] else r.Threads)
+
+    /// Writes into a thread. A player leaves `thread` empty - the server uses
+    /// their own either way; the developer names the one they are reading.
+    let postDm (thread: string) (body: string) (imageKey: string) (width: int) (height: int) : Result<unit, string> =
+        let payload =
+            sprintf
+                "{\"thread\":\"%s\",\"body\":\"%s\",\"image\":\"%s\",\"w\":%d,\"h\":%d}"
+                (escape thread)
+                (escape body)
+                (escape imageKey)
+                (max 0 width)
+                (max 0 height)
+
+        send<SimpleResponse> HttpMethod.Post "/v1/dm" payload |> Result.map ignore
+
     let getChatImage (key: string) : Result<byte[], string> =
         try
             use req = signedRequest HttpMethod.Get ("/v1/chat/image/" + Uri.EscapeDataString(key)) (sha256Hex "")
@@ -588,7 +934,7 @@ module CommunityApi =
             else
                 Error(sprintf "Server returned %d." (int res.StatusCode))
         with ex ->
-            Error ex.Message
+            Error(describeFailure ex)
 
 
 /// What the community grid can be filtered and sorted by, and the words the

@@ -1,4 +1,4 @@
-namespace DLSS_5_MANAGER.Views
+﻿namespace DLSS_5_MANAGER.Views
 
 open System
 open System.Diagnostics
@@ -15,6 +15,40 @@ open Avalonia.Threading
 open Avalonia.VisualTree
 open DLSS_5_MANAGER.Services
 open DLSS_5_MANAGER.ViewModels
+
+/// Where and how big the window was when it closed, so it opens the same way:
+/// a user who made it bigger by hand, or maximised it, got the small default
+/// back on every launch. Its own `window.json`, like `background.json` - a
+/// field in `AppSettings` would mean touching every `saveSettings` site.
+module WindowPlacement =
+    [<CLIMutable>]
+    type Saved =
+        { /// Top-left of the NORMAL (not maximised) window, screen pixels.
+          X: int
+          Y: int
+          /// Its size, device-independent pixels (Width / Height).
+          Width: float
+          Height: float
+          Maximized: bool }
+
+    let private path () =
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "DLSS5Manager", "window.json")
+
+    let load () : Saved option =
+        try
+            let file = path ()
+            if File.Exists(file) then
+                let s = System.Text.Json.JsonSerializer.Deserialize<Saved>(File.ReadAllText(file))
+                if s.Width >= 900.0 && s.Height >= 600.0 then Some s else None
+            else None
+        with _ -> None
+
+    let save (s: Saved) =
+        try
+            let file = path ()
+            Directory.CreateDirectory(Path.GetDirectoryName(file)) |> ignore
+            File.WriteAllText(file, System.Text.Json.JsonSerializer.Serialize(s))
+        with _ -> ()
 
 type MainWindow() as this =
     inherit Window()
@@ -33,9 +67,85 @@ type MainWindow() as this =
     /// Whichever page the wheel last touched - the games grid or the settings.
     let mutable activeScrollViewer: ScrollViewer = null
     let smoothScrollTimer = DispatcherTimer(Interval = TimeSpan.FromMilliseconds(8.0))
+    let mutable screenShutdownComplete = false
+
+    /// The last size and place the window had while neither maximised nor
+    /// minimised - what un-maximising gives back, and what is saved.
+    let mutable normalBounds: PixelPoint * float * float = (PixelPoint(0, 0), 1280.0, 820.0)
+    let mutable wasMaximized = false
 
     do
         this.InitializeComponent()
+
+        // The size and place it closed with (WindowPlacement). A place no
+        // connected screen shows any more - a monitor unplugged since - is
+        // dropped for the centre of the screen.
+        match WindowPlacement.load () with
+        | Some saved ->
+            this.Width <- saved.Width
+            this.Height <- saved.Height
+            this.WindowStartupLocation <- WindowStartupLocation.Manual
+            this.Position <- PixelPoint(saved.X, saved.Y)
+            normalBounds <- (PixelPoint(saved.X, saved.Y), saved.Width, saved.Height)
+            wasMaximized <- saved.Maximized
+
+            this.Opened.Add(fun _ ->
+                let screens = this.Screens
+
+                let visible =
+                    not (isNull screens)
+                    && not (isNull (screens.ScreenFromPoint(PixelPoint(saved.X + 40, saved.Y + 20))))
+
+                if not visible && not (isNull screens) && not (isNull screens.Primary) then
+                    let area = screens.Primary.WorkingArea
+                    let scale = screens.Primary.Scaling
+                    let w = int (saved.Width * scale)
+                    let h = int (saved.Height * scale)
+                    this.Position <- PixelPoint(area.X + max 0 ((area.Width - w) / 2), area.Y + max 0 ((area.Height - h) / 2))
+
+                if saved.Maximized then
+                    this.WindowState <- WindowState.Maximized)
+        | None -> ()
+
+        let remember () =
+            if this.WindowState = WindowState.Normal then
+                // ClientSize: what a drag on the grips changes (Width/Height
+                // keep the value they were given).
+                normalBounds <- (this.Position, this.ClientSize.Width, this.ClientSize.Height)
+
+            if this.WindowState <> WindowState.Minimized then
+                wasMaximized <- (this.WindowState = WindowState.Maximized)
+
+        // Read once things have settled: maximising reports the new size
+        // before the new state, and read at once the maximised size was kept
+        // as the normal one - un-maximising after a restart filled the screen.
+        let rememberLater () = Dispatcher.UIThread.Post((fun () -> remember ()), DispatcherPriority.Background)
+
+        this.PositionChanged.Add(fun _ -> rememberLater ())
+        this.PropertyChanged.Add(fun args ->
+            if args.Property = Window.WindowStateProperty
+               || args.Property = Window.ClientSizeProperty
+               || args.Property = Visual.BoundsProperty then
+                rememberLater ())
+
+        this.Closed.Add(fun _ ->
+            let position, width, height = normalBounds
+            WindowPlacement.save
+                { X = position.X
+                  Y = position.Y
+                  Width = width
+                  Height = height
+                  Maximized = wasMaximized })
+        this.Closing.Add(fun e ->
+            match this.DataContext with
+            | :? MainViewModel as vm when vm.Screen.IsRunning && not screenShutdownComplete ->
+                e.Cancel <- true
+                task {
+                    do! vm.Screen.StopAsync()
+                    screenShutdownComplete <- true
+                    this.Close()
+                } |> ignore
+            | _ -> ())
 
         // Clear TextBox focus whenever the user clicks anywhere outside of it
         this.AddHandler(
@@ -75,6 +185,31 @@ type MainWindow() as this =
         this.Activated.Add(fun _ -> setMotion true)
         this.Deactivated.Add(fun _ -> setMotion false)
 
+        // The resize grips belong to a window that can be sized by hand.
+        // Maximised, its edges are the screen's, and a resize cursor there
+        // would only promise something that cannot happen.
+        this.PropertyChanged.Add(fun args ->
+            if args.Property = Window.WindowStateProperty then
+                match this.FindControl<Panel>("ResizeGrips") with
+                | null -> ()
+                | grips -> grips.IsVisible <- (this.WindowState = WindowState.Normal))
+
+        // The community grid asks for its next page when it is scrolled near its
+        // end - but a grid shorter than the window (maximised, a first page of
+        // twenty on a big screen) has nothing to scroll, and the next page never
+        // came. So after every layout it is asked again whether it reaches a
+        // screen past the window; LoadMore ignores the call while a page is on
+        // its way or when there is nothing more.
+        match this.FindControl<ScrollViewer>("CommunityScrollViewer") with
+        | null -> ()
+        | grid ->
+            grid.LayoutUpdated.Add(fun _ ->
+                if grid.IsEffectivelyVisible && grid.Viewport.Height > 0.0
+                   && grid.Extent.Height - grid.Viewport.Height - grid.Offset.Y < grid.Viewport.Height then
+                    match this.DataContext with
+                    | :? MainViewModel as vm -> vm.Community.LoadMore()
+                    | _ -> ())
+
         // The chat box: Ctrl+V may carry a picture, which a TextBox ignores.
         // Tunnel, so this sees the key before the box pastes text on its own.
         match this.FindControl<TextBox>("PulseDraftBox") with
@@ -98,11 +233,33 @@ type MainWindow() as this =
                 RoutingStrategies.Tunnel
             )
 
+        // The private chat's box behaves exactly like the public one: Ctrl+V can
+        // carry a picture, Enter sends, Shift+Enter starts a new line.
+        match this.FindControl<TextBox>("DmDraftBox") with
+        | null -> ()
+        | dmBox ->
+            dmBox.AddHandler(
+                InputElement.KeyDownEvent,
+                EventHandler<KeyEventArgs>(fun _ e ->
+                    if e.Key = Key.V && e.KeyModifiers.HasFlag(KeyModifiers.Control) then
+                        e.Handled <- true
+                        this.PasteIntoDm(dmBox)
+                    elif e.Key = Key.Enter && not (e.KeyModifiers.HasFlag(KeyModifiers.Shift)) then
+                        e.Handled <- true
+
+                        match this.DataContext with
+                        | :? MainViewModel as vm -> vm.Dm.Send()
+                        | _ -> ()),
+                RoutingStrategies.Tunnel
+            )
+
         // The reply alert watches from the moment the window is up. It sends
         // nothing until this device has written in the chat at least once.
         this.Opened.Add(fun _ ->
             match this.DataContext with
-            | :? MainViewModel as vm -> vm.Pulse.StartWatch()
+            | :? MainViewModel as vm ->
+                vm.Pulse.StartWatch()
+                vm.StartDownloadsHint()
             | _ -> ())
 
         // Esc closes the chat's picture viewer.
@@ -110,8 +267,13 @@ type MainWindow() as this =
             InputElement.KeyDownEvent,
             EventHandler<KeyEventArgs>(fun _ e ->
                 match this.DataContext with
+                | :? MainViewModel as vm when e.Key = Key.Escape && vm.Dm.IsViewerOpen ->
+                    vm.Dm.CloseViewer()
                 | :? MainViewModel as vm when e.Key = Key.Escape && vm.Pulse.IsViewerOpen ->
                     vm.Pulse.CloseViewer()
+                    e.Handled <- true
+                | :? MainViewModel as vm when e.Key = Key.Escape && vm.IsAssetsOpen ->
+                    vm.CloseAssets()
                     e.Handled <- true
                 | _ -> ()),
             RoutingStrategies.Tunnel
@@ -152,6 +314,53 @@ type MainWindow() as this =
             this.WindowState <- WindowState.Maximized
 
     member this.OnCloseClicked(sender: obj, e: RoutedEventArgs) = this.Close()
+
+    /// One of the grips around the frame: the OS takes the drag from here,
+    /// so the resize is as smooth as any native window's.
+    member this.OnResizeGripPressed(sender: obj, e: PointerPressedEventArgs) =
+        match sender with
+        | :? Control as grip when e.GetCurrentPoint(this).Properties.IsLeftButtonPressed
+                                  && this.WindowState = WindowState.Normal ->
+            match grip.Tag with
+            | :? string as tag ->
+                match Enum.TryParse<WindowEdge>(tag) with
+                | true, edge ->
+                    e.Handled <- true
+                    this.BeginResizeDrag(edge, e)
+                | _ -> ()
+            | _ -> ()
+        | _ -> ()
+
+    // =====================================================================
+    // DOWNLOADS SHEET
+    // =====================================================================
+    member this.OnOpenAssetsClicked(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext with
+        | :? MainViewModel as vm -> vm.OpenAssets()
+        | _ -> ()
+
+    member this.OnAssetsCloseClicked(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext with
+        | :? MainViewModel as vm -> vm.CloseAssets()
+        | _ -> ()
+
+    member this.OnAssetsBackdropPressed(sender: obj, e: PointerPressedEventArgs) =
+        match this.DataContext with
+        | :? MainViewModel as vm -> vm.CloseAssets()
+        | _ -> ()
+
+    member this.OnAssetDownloadClicked(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext, sender with
+        | (:? MainViewModel as vm), (:? Control as ctrl) ->
+            match ctrl.DataContext with
+            | :? SetupItemViewModel as item -> vm.Assets.Download(item)
+            | _ -> ()
+        | _ -> ()
+
+    member this.OnAssetsDownloadAllClicked(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext with
+        | :? MainViewModel as vm -> vm.Assets.DownloadEverything()
+        | _ -> ()
 
     // =====================================================================
     // KINETIC SMOOTH SCROLLING
@@ -325,6 +534,11 @@ type MainWindow() as this =
         | :? MainViewModel as vm -> vm.ShowCommunity()
         | _ -> ()
 
+    member this.OnTabScreenClicked(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext with
+        | :? MainViewModel as vm -> vm.ActiveSection <- "screen"
+        | _ -> ()
+
     member this.OnCommunityTutorialsClicked(sender: obj, e: RoutedEventArgs) =
         match this.DataContext with
         | :? MainViewModel as vm -> this.OpenExternal(vm.Community.TutorialsUrl)
@@ -359,6 +573,193 @@ type MainWindow() as this =
     member this.OnPulseTabClicked(sender: obj, e: RoutedEventArgs) =
         match this.DataContext with
         | :? MainViewModel as vm -> vm.ShowPulse()
+        | _ -> ()
+
+    // ---- the private chat -------------------------------------------------
+    member this.OnDmTabClicked(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext with
+        | :? MainViewModel as vm -> vm.ShowDm()
+        | _ -> ()
+
+    member this.OnDmRefreshClicked(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext with
+        | :? MainViewModel as vm -> vm.Dm.Refresh()
+        | _ -> ()
+
+    /// Developer only: the list on the left is not drawn for anybody else.
+    member this.OnDmThreadClicked(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext, sender with
+        | (:? MainViewModel as vm), (:? Control as ctrl) ->
+            match ctrl.DataContext with
+            | :? DmThreadViewModel as item -> vm.Dm.OpenThread(item)
+            | _ -> ()
+        | _ -> ()
+
+    member this.OnDmSendClicked(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext with
+        | :? MainViewModel as vm -> vm.Dm.Send()
+        | _ -> ()
+
+    member this.OnDmRemoveImageClicked(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext with
+        | :? MainViewModel as vm -> vm.Dm.RemoveImage()
+        | _ -> ()
+
+    member this.OnDmAttachClicked(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext with
+        | :? MainViewModel as vm ->
+            let options = FilePickerOpenOptions(Title = "Pick a picture", AllowMultiple = false)
+
+            options.FileTypeFilter <-
+                [| FilePickerFileType(
+                       "Pictures",
+                       Patterns = [| "*.png"; "*.jpg"; "*.jpeg"; "*.webp"; "*.gif"; "*.bmp" |]
+                   ) |]
+
+            async {
+                let! files = this.StorageProvider.OpenFilePickerAsync(options) |> Async.AwaitTask
+
+                if files <> null && files.Count > 0 then
+                    vm.Dm.AttachImage(files.[0].Path.LocalPath)
+            }
+            |> Async.StartImmediate
+        | _ -> ()
+
+    // ---- the gallery ------------------------------------------------------
+    member this.OnGalleryTabClicked(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext with
+        | :? MainViewModel as vm -> vm.ShowGallery()
+        | _ -> ()
+
+    member this.OnGalleryWallClicked(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext with
+        | :? MainViewModel as vm -> vm.Gallery.ShowWall()
+        | _ -> ()
+
+    member this.OnGalleryQueueClicked(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext with
+        | :? MainViewModel as vm -> vm.Gallery.ShowQueue()
+        | _ -> ()
+
+    member this.OnGalleryRefreshClicked(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext with
+        | :? MainViewModel as vm -> vm.Gallery.Refresh()
+        | _ -> ()
+
+    member this.OnGalleryUploadClicked(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext with
+        | :? MainViewModel as vm ->
+            let options = FilePickerOpenOptions(Title = "Pick a picture", AllowMultiple = false)
+
+            options.FileTypeFilter <-
+                [| FilePickerFileType(
+                       "Pictures",
+                       Patterns = [| "*.png"; "*.jpg"; "*.jpeg"; "*.webp"; "*.gif"; "*.bmp" |]
+                   ) |]
+
+            async {
+                let! files = this.StorageProvider.OpenFilePickerAsync(options) |> Async.AwaitTask
+
+                if files <> null && files.Count > 0 then
+                    vm.Gallery.Upload(files.[0].Path.LocalPath)
+            }
+            |> Async.StartImmediate
+        | _ -> ()
+
+    member this.OnGalleryApproveClicked(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext, sender with
+        | (:? MainViewModel as vm), (:? Control as ctrl) ->
+            match ctrl.DataContext with
+            | :? GalleryItemViewModel as item -> vm.Gallery.Approve(item)
+            | _ -> ()
+        | _ -> ()
+
+    member this.OnGalleryRejectClicked(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext, sender with
+        | (:? MainViewModel as vm), (:? Control as ctrl) ->
+            match ctrl.DataContext with
+            | :? GalleryItemViewModel as item -> vm.Gallery.Reject(item)
+            | _ -> ()
+        | _ -> ()
+
+    /// The picture open in the chat viewer, copied onto the wall. Only drawn
+    /// for the developer; the server checks again before it copies anything.
+    member this.OnPromoteToGalleryClicked(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext with
+        | :? MainViewModel as vm ->
+            vm.Gallery.Promote(vm.Pulse.ViewerId, "")
+            vm.Pulse.CloseViewer()
+        | _ -> ()
+
+    /// A wall picture loads when its card comes within reach of the visible
+    /// part of the tab - a screen's height either side, so it is ready by the
+    /// time it scrolls in - and not before. Opening the gallery therefore
+    /// fetches the few pictures on screen, not the whole wall at once.
+    member this.OnGalleryImageViewportChanged(sender: obj, e: Avalonia.Layout.EffectiveViewportChangedEventArgs) =
+        match sender with
+        | :? Control as ctrl ->
+            match ctrl.DataContext with
+            | :? GalleryItemViewModel as item when not item.ImageStarted ->
+                let view = e.EffectiveViewport
+
+                if view.Width > 0.0 && view.Height > 0.0 then
+                    let reach = Rect(view.X, view.Y - view.Height, view.Width, view.Height * 3.0)
+
+                    if reach.Intersects(Rect(ctrl.Bounds.Size)) then
+                        item.EnsureImage()
+            | _ -> ()
+        | _ -> ()
+
+    member this.OnGalleryImageClicked(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext, sender with
+        | (:? MainViewModel as vm), (:? Control as ctrl) ->
+            match ctrl.DataContext with
+            | :? GalleryItemViewModel as item -> vm.Gallery.OpenViewer(item)
+            | _ -> ()
+        | _ -> ()
+
+    member this.OnGalleryViewerCloseClicked(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext with
+        | :? MainViewModel as vm -> vm.Gallery.CloseViewer()
+        | _ -> ()
+
+    member this.OnGalleryViewerBackdropPressed(sender: obj, e: PointerPressedEventArgs) =
+        match this.DataContext with
+        | :? MainViewModel as vm -> vm.Gallery.CloseViewer()
+        | _ -> ()
+
+    /// Saves where the user chooses, exactly as the chat viewer does.
+    member this.OnGalleryViewerSaveClicked(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext with
+        | :? MainViewModel as vm when not (isNull vm.Gallery.ViewerBytes) ->
+            let bytes = vm.Gallery.ViewerBytes
+            let name = vm.Gallery.ViewerFileName
+
+            task {
+                try
+                    let options =
+                        FilePickerSaveOptions(
+                            Title = "Save picture",
+                            SuggestedFileName = name,
+                            DefaultExtension = "png",
+                            ShowOverwritePrompt = true
+                        )
+
+                    options.FileTypeChoices <-
+                        [| FilePickerFileType("PNG image", Patterns = [| "*.png" |])
+                           FilePickerFileType("WebP image", Patterns = [| "*.webp" |]) |]
+
+                    let! file = this.StorageProvider.SaveFilePickerAsync(options)
+
+                    if not (isNull file) then
+                        let asWebp = file.Name.EndsWith(".webp", StringComparison.OrdinalIgnoreCase)
+                        let! data = Task.Run(fun () -> if asWebp then bytes else ChatImages.toPng bytes)
+                        use! stream = file.OpenWriteAsync()
+                        do! stream.WriteAsync(data, 0, data.Length)
+                with _ ->
+                    ()
+            }
+            |> ignore
         | _ -> ()
 
     member this.OnCommunityClearFiltersClicked(sender: obj, e: RoutedEventArgs) =
@@ -417,6 +818,24 @@ type MainWindow() as this =
                 && [ ".png"; ".jpg"; ".jpeg"; ".webp"; ".gif"; ".bmp" ]
                    |> List.contains (Path.GetExtension(path).ToLowerInvariant())
 
+            // What the paste does once everything is read - outside the task,
+            // so its state machine stays statically compilable (FS3511).
+            let apply (picture: string option) (text: string) (bitmap: Avalonia.Media.Imaging.Bitmap) =
+                match picture with
+                | Some path -> vm.Pulse.AttachImage(path)
+                | None when not (String.IsNullOrEmpty(text)) ->
+                    let clean = text.Replace("\r\n", " ").Replace('\n', ' ').Replace('\r', ' ')
+                    let current = if isNull box.Text then "" else box.Text
+                    let a = max 0 (min current.Length (min box.SelectionStart box.SelectionEnd))
+                    let b = max 0 (min current.Length (max box.SelectionStart box.SelectionEnd))
+                    box.Text <- current.Remove(a, b - a).Insert(a, clean)
+                    box.CaretIndex <- a + clean.Length
+                | None when not (isNull bitmap) ->
+                    use ms = new MemoryStream()
+                    bitmap.Save(ms, Avalonia.Media.Imaging.PngBitmapEncoderOptions.Default)
+                    vm.Pulse.AttachImageBytes(ms.ToArray())
+                | None -> ()
+
             task {
                 try
                     let! files = clipboard.TryGetFilesAsync()
@@ -425,29 +844,141 @@ type MainWindow() as this =
                         if isNull files then None
                         else files |> Seq.tryPick (fun f -> match f.TryGetLocalPath() with p when isPicture p -> Some p | _ -> None)
 
-                    match picture with
-                    | Some path -> vm.Pulse.AttachImage(path)
-                    | None ->
-                        let! text = clipboard.TryGetTextAsync()
+                    // Each await in a straight line, never inside a branch: only
+                    // then can the compiler build the task statically (warning
+                    // FS3511 otherwise). Same rules as before - a picture file,
+                    // else text, else a picture on the clipboard.
+                    let! text =
+                        if picture.IsSome then Task.FromResult<string>(null)
+                        else clipboard.TryGetTextAsync()
 
-                        if not (String.IsNullOrEmpty(text)) then
-                            let clean = text.Replace("\r\n", " ").Replace('\n', ' ').Replace('\r', ' ')
-                            let current = if isNull box.Text then "" else box.Text
-                            let a = max 0 (min current.Length (min box.SelectionStart box.SelectionEnd))
-                            let b = max 0 (min current.Length (max box.SelectionStart box.SelectionEnd))
-                            box.Text <- current.Remove(a, b - a).Insert(a, clean)
-                            box.CaretIndex <- a + clean.Length
-                        else
-                            let! bitmap = clipboard.TryGetBitmapAsync()
+                    let! bitmap =
+                        if picture.IsNone && String.IsNullOrEmpty(text) then clipboard.TryGetBitmapAsync()
+                        else Task.FromResult<Avalonia.Media.Imaging.Bitmap>(null)
 
-                            if not (isNull bitmap) then
-                                use ms = new MemoryStream()
-                                bitmap.Save(ms)
-                                vm.Pulse.AttachImageBytes(ms.ToArray())
+                    apply picture text bitmap
                 with _ ->
                     ()
             }
             |> ignore
+        | _ -> ()
+
+    /// Ctrl+V in the private chat, by the same rules as the public one: a
+    /// copied picture file or a picture on the clipboard becomes the
+    /// attachment, and text is pasted as text - line breaks kept, since this
+    /// box, unlike a single-line one, can hold them.
+    member private this.PasteIntoDm(box: TextBox) =
+        match this.DataContext, TopLevel.GetTopLevel(this) with
+        | (:? MainViewModel as vm), top when not (isNull top) && not (isNull top.Clipboard) ->
+            let clipboard = top.Clipboard
+
+            let isPicture (path: string) =
+                not (isNull path)
+                && [ ".png"; ".jpg"; ".jpeg"; ".webp"; ".gif"; ".bmp" ]
+                   |> List.contains (Path.GetExtension(path).ToLowerInvariant())
+
+            // Outside the task, as in PasteIntoChat.
+            let apply (picture: string option) (text: string) (bitmap: Avalonia.Media.Imaging.Bitmap) =
+                match picture with
+                | Some path -> vm.Dm.AttachImage(path)
+                | None when not (String.IsNullOrEmpty(text)) ->
+                    let current = if isNull box.Text then "" else box.Text
+                    let a = max 0 (min current.Length (min box.SelectionStart box.SelectionEnd))
+                    let b = max 0 (min current.Length (max box.SelectionStart box.SelectionEnd))
+                    box.Text <- current.Remove(a, b - a).Insert(a, text)
+                    box.CaretIndex <- a + text.Length
+                | None when not (isNull bitmap) ->
+                    use ms = new MemoryStream()
+                    bitmap.Save(ms, Avalonia.Media.Imaging.PngBitmapEncoderOptions.Default)
+                    vm.Dm.AttachImageBytes(ms.ToArray())
+                | None -> ()
+
+            task {
+                try
+                    let! files = clipboard.TryGetFilesAsync()
+
+                    let picture =
+                        if isNull files then None
+                        else files |> Seq.tryPick (fun f -> match f.TryGetLocalPath() with p when isPicture p -> Some p | _ -> None)
+
+                    // Awaits in a straight line, as in PasteIntoChat.
+                    let! text =
+                        if picture.IsSome then Task.FromResult<string>(null)
+                        else clipboard.TryGetTextAsync()
+
+                    let! bitmap =
+                        if picture.IsNone && String.IsNullOrEmpty(text) then clipboard.TryGetBitmapAsync()
+                        else Task.FromResult<Avalonia.Media.Imaging.Bitmap>(null)
+
+                    apply picture text bitmap
+                with _ ->
+                    ()
+            }
+            |> ignore
+        | _ -> ()
+
+    member this.OnDmImageClicked(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext, sender with
+        | (:? MainViewModel as vm), (:? Control as ctrl) ->
+            match ctrl.DataContext with
+            | :? DmMessageViewModel as item -> vm.Dm.OpenViewer(item)
+            | _ -> ()
+        | _ -> ()
+
+    member this.OnDmViewerCloseClicked(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext with
+        | :? MainViewModel as vm -> vm.Dm.CloseViewer()
+        | _ -> ()
+
+    member this.OnDmViewerBackdropPressed(sender: obj, e: PointerPressedEventArgs) =
+        match this.DataContext with
+        | :? MainViewModel as vm -> vm.Dm.CloseViewer()
+        | _ -> ()
+
+    /// A key picked from one of the sheet's key menus. The menu closes behind
+    /// the choice, so the chip shows the new key straight away.
+    member private this.CloseMenuOf(ctrl: Control) =
+        match Avalonia.LogicalTree.LogicalExtensions.FindLogicalAncestorOfType<Avalonia.Controls.Primitives.Popup>(ctrl, false) with
+        | null -> ()
+        | popup -> popup.IsOpen <- false
+
+    member this.OnChooseOverlayKey(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext, sender with
+        | (:? MainViewModel as vm), (:? Control as ctrl) ->
+            match ctrl.Tag with
+            | :? string as key ->
+                vm.ChooseOverlayKey(key)
+                this.CloseMenuOf(ctrl)
+            | _ -> ()
+        | _ -> ()
+
+    member this.OnChooseReShadeKey(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext, sender with
+        | (:? MainViewModel as vm), (:? Control as ctrl) ->
+            match ctrl.Tag with
+            | :? string as key ->
+                vm.ChooseReShadeKey(key)
+                this.CloseMenuOf(ctrl)
+            | _ -> ()
+        | _ -> ()
+
+    member this.OnChooseOptiMenuKey(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext, sender with
+        | (:? MainViewModel as vm), (:? Control as ctrl) ->
+            match ctrl.Tag with
+            | :? string as key ->
+                vm.ChooseOptiMenuKey(key)
+                this.CloseMenuOf(ctrl)
+            | _ -> ()
+        | _ -> ()
+
+    /// The small SPECS button on a report: the rest of the machine, folded.
+    member this.OnToggleSpecsClicked(sender: obj, e: RoutedEventArgs) =
+        match sender with
+        | :? Control as ctrl ->
+            match ctrl.DataContext with
+            | :? CommunityReportViewModel as report -> report.ToggleSpecs()
+            | _ -> ()
         | _ -> ()
 
     member this.OnChatEmojiClicked(sender: obj, e: RoutedEventArgs) =
@@ -524,6 +1055,16 @@ type MainWindow() as this =
         | _ -> ()
 
     // ---- the reply alert ---------------------------------------------------
+    member this.OnDownloadsHintPressed(sender: obj, e: PointerPressedEventArgs) =
+        match this.DataContext with
+        | :? MainViewModel as vm -> vm.OpenAssetsFromHint()
+        | _ -> ()
+
+    member this.OnDownloadsHintCloseClicked(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext with
+        | :? MainViewModel as vm -> vm.DismissDownloadsHint()
+        | _ -> ()
+
     member this.OnReplyToastPressed(sender: obj, e: PointerPressedEventArgs) =
         match this.DataContext with
         | :? MainViewModel as vm -> vm.OpenChatFromReply()
@@ -540,6 +1081,21 @@ type MainWindow() as this =
             match ctrl.DataContext with
             | :? PulseMessageViewModel as message -> vm.Pulse.OpenViewer(message)
             | _ -> ()
+        | _ -> ()
+
+    /// Puts one of your own messages back into the composer. The link is only
+    /// drawn while the minute lasts, so this is never reached after it.
+    member this.OnChatEditClicked(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext, sender with
+        | (:? MainViewModel as vm), (:? Control as ctrl) ->
+            match ctrl.DataContext with
+            | :? PulseMessageViewModel as message -> vm.Pulse.BeginEdit(message)
+            | _ -> ()
+        | _ -> ()
+
+    member this.OnChatCancelEditClicked(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext with
+        | :? MainViewModel as vm -> vm.Pulse.CancelEdit()
         | _ -> ()
 
     member this.OnChatViewerCloseClicked(sender: obj, e: RoutedEventArgs) =
@@ -793,10 +1349,19 @@ type MainWindow() as this =
         | :? MainViewModel as vm ->
             vm.ToggleSearch()
             if vm.IsSearchOpen then
+                // Three places the box can be now: the title bar, the sidebar
+                // layout's own copy, and the community filter row it moves down
+                // to while that grid is open. The community one is asked first
+                // and by *effective* visibility - it lives inside a panel that
+                // is collapsed everywhere else, and its own IsVisible would
+                // still read true in there.
                 let searchBox =
                     let sb1 = this.FindControl<TextBox>("SearchInputBox")
                     let sb2 = this.FindControl<TextBox>("SearchInputBoxSidebar")
-                    if sb1 <> null && sb1.IsVisible then sb1
+                    let sb3 = this.FindControl<TextBox>("SearchInputBoxCommunity")
+
+                    if sb3 <> null && sb3.IsEffectivelyVisible then sb3
+                    elif sb1 <> null && sb1.IsVisible then sb1
                     elif sb2 <> null && sb2.IsVisible then sb2
                     elif sb1 <> null then sb1
                     else sb2
@@ -804,6 +1369,29 @@ type MainWindow() as this =
                 if searchBox <> null then
                     searchBox.Focus() |> ignore
                     searchBox.SelectAll()
+        | _ -> ()
+
+    // ---- the developer's pinned note on a community game ----------------
+    member this.OnPinNoteClicked(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext with
+        | :? MainViewModel as vm -> vm.Community.OpenNoteEditor()
+        | _ -> ()
+
+    member this.OnCancelNoteClicked(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext with
+        | :? MainViewModel as vm -> vm.Community.CloseNoteEditor()
+        | _ -> ()
+
+    member this.OnSaveNoteClicked(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext with
+        | :? MainViewModel as vm -> vm.Community.SaveSheetNote()
+        | _ -> ()
+
+    member this.OnDisableAutoScanClicked(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext with
+        | :? MainViewModel as vm ->
+            UiSounds.tickOff ()
+            vm.DisableAutoScan()
         | _ -> ()
 
     member this.OnRescanClicked(sender: obj, e: RoutedEventArgs) =
@@ -873,12 +1461,70 @@ type MainWindow() as this =
             | _ -> ()
         | _ -> ()
 
+    /// Settings -> Visual Atmosphere: a picture tile. The last tile is the
+    /// user's own picture and the only way to pick one: empty, it asks for a
+    /// picture; holding one, it switches to it; already showing, it asks for a
+    /// different one.
+    member this.OnBackgroundTileClicked(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext, sender with
+        | (:? MainViewModel as vm), (:? Control as ctrl) ->
+            match ctrl.DataContext with
+            | :? AtmosphereOption as option when option.IsCustom ->
+                if vm.HasCustomBackground && not vm.IsCustomBackgroundActive then vm.UseCustomBackground()
+                else this.PickCustomBackground(vm)
+            | :? AtmosphereOption as option -> vm.ChooseAtmosphere(option)
+            | _ -> ()
+        | _ -> ()
+
+    /// The x on the custom tile. Handled here, or the click would carry on up
+    /// to the tile it sits on and open the picker straight after.
+    member this.OnRemoveCustomBackgroundClicked(sender: obj, e: RoutedEventArgs) =
+        e.Handled <- true
+
+        match this.DataContext with
+        | :? MainViewModel as vm -> vm.RemoveCustomBackground()
+        | _ -> ()
+
+    member private this.PickCustomBackground(vm: MainViewModel) =
+        let options = FilePickerOpenOptions()
+        options.Title <- "Choose a background picture"
+        options.AllowMultiple <- false
+
+        let fileType = FilePickerFileType("Images")
+        fileType.Patterns <- [| "*.png"; "*.jpg"; "*.jpeg"; "*.bmp"; "*.webp" |]
+        options.FileTypeFilter <- [| fileType |]
+
+        async {
+            let! files = this.StorageProvider.OpenFilePickerAsync(options) |> Async.AwaitTask
+            if files <> null && files.Count > 0 then
+                vm.SetCustomBackground(files.[0].Path.LocalPath)
+        }
+        |> Async.StartImmediate
+
+    member this.OnRestoreCoverClicked(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext, sender with
+        | (:? MainViewModel as vm), (:? Control as ctrl) ->
+            match ctrl.DataContext with
+            | :? GameCardViewModel as card -> vm.RestoreGameCover(card)
+            | _ -> ()
+        | _ -> ()
+
     /// Right-click flyout on a card: take the title out of the library.
     member this.OnRemoveGameClicked(sender: obj, e: RoutedEventArgs) =
         match this.DataContext, sender with
         | (:? MainViewModel as vm), (:? Control as ctrl) ->
             match ctrl.DataContext with
             | :? GameCardViewModel as card -> vm.RemoveGame(card)
+            | _ -> ()
+        | _ -> ()
+
+    /// The same, but the title is also recorded so the next scan leaves it
+    /// alone. Adding it by hand afterwards still works.
+    member this.OnRemoveAndExcludeGameClicked(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext, sender with
+        | (:? MainViewModel as vm), (:? Control as ctrl) ->
+            match ctrl.DataContext with
+            | :? GameCardViewModel as card -> vm.RemoveGame(card, true)
             | _ -> ()
         | _ -> ()
 
@@ -1089,74 +1735,262 @@ type MainWindow() as this =
             vm.SetInstallMode(ModInstaller.Dx9)
         | _ -> ()
 
+    // Every one of these answers the same way the route buttons do: a sound
+    // only when the click actually changes something. Clicking the option that
+    // is already chosen stays silent, or holding a toggle down would rattle.
+    /// The developer correcting one report's verdict. The button carries the
+    /// new status in its Tag; the card it sits on is the report.
+    member this.OnCorrectStatusClicked(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext, sender with
+        | (:? MainViewModel as vm), (:? Control as ctrl) ->
+            match ctrl.DataContext, ctrl.Tag with
+            | (:? CommunityReportViewModel as report), (:? string as status) ->
+                vm.Community.CorrectStatus(report, status)
+            | _ -> ()
+        | _ -> ()
+
+    /// The author's own verdict. Same three chips as the developer's row, but
+    /// this one is drawn only on reports this machine filed.
+    member this.OnEditOwnStatusClicked(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext, sender with
+        | (:? MainViewModel as vm), (:? Control as ctrl) ->
+            match ctrl.DataContext, ctrl.Tag with
+            | (:? CommunityReportViewModel as report), (:? string as status) ->
+                vm.Community.EditOwnStatus(report, status)
+            | _ -> ()
+        | _ -> ()
+
+    member this.OnBeginEditBodyClicked(sender: obj, e: RoutedEventArgs) =
+        match sender with
+        | :? Control as ctrl ->
+            match ctrl.DataContext with
+            | :? CommunityReportViewModel as report -> report.BeginEditBody()
+            | _ -> ()
+        | _ -> ()
+
+    member this.OnCancelEditBodyClicked(sender: obj, e: RoutedEventArgs) =
+        match sender with
+        | :? Control as ctrl ->
+            match ctrl.DataContext with
+            | :? CommunityReportViewModel as report -> report.CancelEditBody()
+            | _ -> ()
+        | _ -> ()
+
+    member this.OnSaveOwnBodyClicked(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext, sender with
+        | (:? MainViewModel as vm), (:? Control as ctrl) ->
+            match ctrl.DataContext with
+            | :? CommunityReportViewModel as report -> vm.Community.SaveOwnBody(report)
+            | _ -> ()
+        | _ -> ()
+
+    member this.OnBeginEditCommentClicked(sender: obj, e: RoutedEventArgs) =
+        match sender with
+        | :? Control as ctrl ->
+            match ctrl.DataContext with
+            | :? CommunityCommentViewModel as comment -> comment.BeginEdit()
+            | _ -> ()
+        | _ -> ()
+
+    member this.OnCancelEditCommentClicked(sender: obj, e: RoutedEventArgs) =
+        match sender with
+        | :? Control as ctrl ->
+            match ctrl.DataContext with
+            | :? CommunityCommentViewModel as comment -> comment.CancelEdit()
+            | _ -> ()
+        | _ -> ()
+
+    member this.OnSaveOwnCommentClicked(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext, sender with
+        | (:? MainViewModel as vm), (:? Control as ctrl) ->
+            match ctrl.DataContext with
+            | :? CommunityCommentViewModel as comment -> vm.Community.SaveOwnComment(comment)
+            | _ -> ()
+        | _ -> ()
+
+    member this.OnMarkTestedByDevClicked(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext with
+        | :? MainViewModel as vm -> vm.Community.MarkGameTestedByDev()
+        | _ -> ()
+
+    member this.OnRemoveReportClicked(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext, sender with
+        | (:? MainViewModel as vm), (:? Control as ctrl) ->
+            match ctrl.DataContext with
+            | :? CommunityReportViewModel as report -> vm.Community.RemoveReport(report)
+            | _ -> ()
+        | _ -> ()
+
+    member this.OnToggleInstallResultClicked(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext with
+        | :? MainViewModel as vm -> vm.ToggleInstallResult()
+        | _ -> ()
+
+    member this.OnSetVulkanMode(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext with
+        | :? MainViewModel as vm ->
+            if not vm.IsVulkanMode then UiSounds.tick ()
+            vm.SetInstallMode(ModInstaller.VulkanMode)
+        | _ -> ()
+
     member this.OnSetOptiDx12(sender: obj, e: RoutedEventArgs) =
         match this.DataContext with
-        | :? MainViewModel as vm -> vm.SetOptiApi(ModInstaller.OptiDx12)
+        | :? MainViewModel as vm ->
+            if not vm.IsOptiDx12 then UiSounds.tick ()
+            vm.SetOptiApi(ModInstaller.OptiDx12)
         | _ -> ()
 
     member this.OnSetOptiVulkan(sender: obj, e: RoutedEventArgs) =
         match this.DataContext with
-        | :? MainViewModel as vm -> vm.SetOptiApi(ModInstaller.OptiVulkan)
+        | :? MainViewModel as vm ->
+            if not vm.IsOptiVulkan then UiSounds.tick ()
+            vm.SetOptiApi(ModInstaller.OptiVulkan)
         | _ -> ()
 
     member this.OnSetOptiNeural(sender: obj, e: RoutedEventArgs) =
         match this.DataContext with
-        | :? MainViewModel as vm -> vm.SetOptiApi(ModInstaller.OptiNeural)
+        | :? MainViewModel as vm ->
+            if not vm.IsOptiNeural then UiSounds.tick ()
+            vm.SetOptiApi(ModInstaller.OptiNeural)
         | _ -> ()
 
     member this.OnSetNeuralAddonOn(sender: obj, e: RoutedEventArgs) =
         match this.DataContext with
-        | :? MainViewModel as vm -> vm.SetNeuralAddon(true)
+        | :? MainViewModel as vm ->
+            if not vm.IsNeuralAddonOn then UiSounds.toggle true
+            vm.SetNeuralAddon(true)
         | _ -> ()
 
     member this.OnSetNeuralAddonOff(sender: obj, e: RoutedEventArgs) =
         match this.DataContext with
-        | :? MainViewModel as vm -> vm.SetNeuralAddon(false)
+        | :? MainViewModel as vm ->
+            if vm.IsNeuralAddonOn then UiSounds.toggle false
+            vm.SetNeuralAddon(false)
         | _ -> ()
 
     member this.OnSetMfgUnlockOn(sender: obj, e: RoutedEventArgs) =
         match this.DataContext with
-        | :? MainViewModel as vm -> vm.SetMfgUnlock(true)
+        | :? MainViewModel as vm ->
+            if not vm.IsMfgUnlockOn then UiSounds.toggle true
+            vm.SetMfgUnlock(true)
         | _ -> ()
 
     member this.OnSetMfgUnlockOff(sender: obj, e: RoutedEventArgs) =
         match this.DataContext with
-        | :? MainViewModel as vm -> vm.SetMfgUnlock(false)
+        | :? MainViewModel as vm ->
+            if vm.IsMfgUnlockOn then UiSounds.toggle false
+            vm.SetMfgUnlock(false)
         | _ -> ()
 
     member this.OnSetMultipassOn(sender: obj, e: RoutedEventArgs) =
         match this.DataContext with
-        | :? MainViewModel as vm -> vm.SetMultipass(true)
+        | :? MainViewModel as vm ->
+            if not vm.IsMultipassOn then UiSounds.toggle true
+            vm.SetMultipass(true)
+        | _ -> ()
+
+    member this.OnSetDeepFriedOn(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext with
+        | :? MainViewModel as vm ->
+            if not vm.IsDeepFriedOn then UiSounds.toggle true
+            vm.SetDeepFried(true)
+        | _ -> ()
+
+    member this.OnSetDeepFriedOff(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext with
+        | :? MainViewModel as vm ->
+            if vm.IsDeepFriedOn then UiSounds.toggle false
+            vm.SetDeepFried(false)
         | _ -> ()
 
     member this.OnSetMultipassOff(sender: obj, e: RoutedEventArgs) =
         match this.DataContext with
-        | :? MainViewModel as vm -> vm.SetMultipass(false)
+        | :? MainViewModel as vm ->
+            if vm.IsMultipassOn then UiSounds.toggle false
+            vm.SetMultipass(false)
         | _ -> ()
 
     member this.OnSetOverlayOn(sender: obj, e: RoutedEventArgs) =
         match this.DataContext with
-        | :? MainViewModel as vm -> vm.IsOverlayEnabled <- true
+        | :? MainViewModel as vm ->
+            if not vm.IsOverlayEnabled then UiSounds.toggle true
+            vm.IsOverlayEnabled <- true
         | _ -> ()
 
     member this.OnSetOverlayOff(sender: obj, e: RoutedEventArgs) =
         match this.DataContext with
-        | :? MainViewModel as vm -> vm.IsOverlayEnabled <- false
+        | :? MainViewModel as vm ->
+            if vm.IsOverlayEnabled then UiSounds.toggle false
+            vm.IsOverlayEnabled <- false
         | _ -> ()
 
     member this.OnSetBit64(sender: obj, e: RoutedEventArgs) =
         match this.DataContext with
-        | :? MainViewModel as vm -> vm.SetInstallArch(ModInstaller.Bit64)
+        | :? MainViewModel as vm ->
+            if not vm.IsBit64 then UiSounds.tick ()
+            vm.SetInstallArch(ModInstaller.Bit64)
         | _ -> ()
 
     member this.OnSetBit32(sender: obj, e: RoutedEventArgs) =
         match this.DataContext with
-        | :? MainViewModel as vm -> vm.SetInstallArch(ModInstaller.Bit32)
+        | :? MainViewModel as vm ->
+            if not vm.IsBit32 then UiSounds.tick ()
+            vm.SetInstallArch(ModInstaller.Bit32)
         | _ -> ()
 
     member this.OnToggleTargetDetailsClicked(sender: obj, e: RoutedEventArgs) =
         match this.DataContext with
         | :? MainViewModel as vm -> vm.ToggleTargetDetails()
+        | _ -> ()
+
+    member this.OnToggleCommunityGlanceClicked(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext with
+        | :? MainViewModel as vm -> vm.ToggleCommunityGlance()
+        | _ -> ()
+
+    member this.OnToggleDllNamesClicked(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext with
+        | :? MainViewModel as vm ->
+            vm.ToggleDllNames()
+
+            // Opened at the very bottom of the sheet: bring it up into view.
+            if vm.IsDllNamesOpen then
+                Dispatcher.UIThread.Post(
+                    (fun () ->
+                        match this.FindControl<Border>("DllNameCard") with
+                        | null -> ()
+                        | card -> card.BringIntoView()),
+                    DispatcherPriority.Background)
+        | _ -> ()
+
+    member this.OnRenameOptiPickClicked(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext with
+        | :? MainViewModel as vm -> vm.RenameOptiToPick()
+        | _ -> ()
+
+    member this.OnRenameOptiCustomClicked(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext with
+        | :? MainViewModel as vm -> vm.RenameOptiToCustom()
+        | _ -> ()
+
+    member this.OnRenameReShadePickClicked(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext with
+        | :? MainViewModel as vm -> vm.RenameReShadeToPick()
+        | _ -> ()
+
+    member this.OnRenameReShadeCustomClicked(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext with
+        | :? MainViewModel as vm -> vm.RenameReShadeToCustom()
+        | _ -> ()
+
+    member this.OnRefreshGlanceClicked(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext with
+        | :? MainViewModel as vm -> vm.RefreshCommunityGlance()
+        | _ -> ()
+
+    member this.OnOpenGlanceInCommunityClicked(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext with
+        | :? MainViewModel as vm -> vm.OpenGlanceInCommunity()
         | _ -> ()
 
     member this.OnManageCloseClicked(sender: obj, e: RoutedEventArgs) =
@@ -1183,6 +2017,54 @@ type MainWindow() as this =
                     Process.Start(ProcessStartInfo(vm.ManageFolder, UseShellExecute = true)) |> ignore
             with _ ->
                 ()
+        | _ -> ()
+
+    /// Runs the executable this sheet points at, so a change can be tried
+    /// without going out to Explorer for it. Silent on failure by design - a
+    /// game that refuses to start is not this app's error to raise.
+    member this.OnLaunchTargetClicked(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext with
+        | :? MainViewModel as vm ->
+            try
+                if not (String.IsNullOrWhiteSpace(vm.ManageExePath)) && File.Exists(vm.ManageExePath) then
+                    let psi = ProcessStartInfo(vm.ManageExePath, UseShellExecute = true)
+                    // Plenty of games only find their data when started from
+                    // their own folder.
+                    psi.WorkingDirectory <- Path.GetDirectoryName(vm.ManageExePath)
+                    Process.Start(psi) |> ignore
+            with _ ->
+                ()
+        | _ -> ()
+
+    /// Re-reads this one game. The whole-library rescan is in Settings; this is
+    /// for the far more common case of having just changed something in one
+    /// game's folder.
+    member this.OnRescanGameClicked(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext with
+        | :? MainViewModel as vm ->
+            UiSounds.tick ()
+            vm.AnalyzeManageTarget()
+        | _ -> ()
+
+    member this.OnReplaceOptiScalerRtx40Clicked(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext with
+        | :? MainViewModel as vm ->
+            let options = FolderPickerOpenOptions()
+            options.Title <- "Select the OptiScaler RTX 40 folder (must contain OptiScaler.dll)"
+            options.AllowMultiple <- false
+
+            async {
+                let! folders = this.StorageProvider.OpenFolderPickerAsync(options) |> Async.AwaitTask
+
+                if folders <> null && folders.Count > 0 then
+                    vm.ReplaceOptiScalerRtx40(folders.[0].Path.LocalPath)
+            }
+            |> Async.StartImmediate
+        | _ -> ()
+
+    member this.OnRestoreOptiScalerRtx40Clicked(sender: obj, e: RoutedEventArgs) =
+        match this.DataContext with
+        | :? MainViewModel as vm -> vm.RestoreOptiScalerRtx40()
         | _ -> ()
 
     member this.OnChangeExecutableClicked(sender: obj, e: RoutedEventArgs) =

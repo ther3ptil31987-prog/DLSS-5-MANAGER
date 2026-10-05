@@ -1,13 +1,15 @@
-namespace DLSS_5_MANAGER.ViewModels
+﻿namespace DLSS_5_MANAGER.ViewModels
 
 open System
 open System.IO
 open System.Text.RegularExpressions
+open System.Threading.Tasks
 open Avalonia.Media.Imaging
+open Avalonia.Threading
 open DLSS_5_MANAGER.Models
 open DLSS_5_MANAGER.Services
 
-type GameCardViewModel(game: GameItem) =
+type GameCardViewModel(game: GameItem) as this =
     inherit ViewModelBase()
 
     /// The record is swapped whenever the user corrects the detected executable.
@@ -23,17 +25,49 @@ type GameCardViewModel(game: GameItem) =
         let cleaned = Regex.Replace(raw, @"\[.*?\]|\(.*?\)", "").Trim()
         if String.IsNullOrWhiteSpace(cleaned) then raw else cleaned
 
+    let mutable coverRequested = false
+
+    /// Nothing on disk for this game.
+    ///
+    /// The community grid finds artwork for the very same titles, because it
+    /// resolves them against Steam's library images rather than hoping a
+    /// launcher left a file behind. This asks that same question, off the UI
+    /// thread, and fills the card in when the answer arrives. A title with no
+    /// artwork is remembered as such, so it is asked about once and no more.
+    let fetchCover () =
+        if not coverRequested then
+            coverRequested <- true
+            let appId = currentGame.AppId
+            let title = currentGame.Title
+
+            Task.Run(fun () ->
+                let file = SteamCovers.resolve appId title
+
+                if file <> "" then
+                    Dispatcher.UIThread.Post(fun () -> this.SetBanner(file)))
+            |> ignore
+
     let loadBitmap () =
         if not isBitmapLoaded then
             isBitmapLoaded <- true
             try
-                if not (String.IsNullOrWhiteSpace(currentGame.LocalBannerPath)) && File.Exists(currentGame.LocalBannerPath) then
-                    use stream = File.OpenRead(currentGame.LocalBannerPath)
+                // A cover the user picked wins over whatever the scan found,
+                // and is looked up rather than stored in the record - which is
+                // what makes it survive the next scan.
+                let path =
+                    match GameScanner.customCoverPath currentGame with
+                    | Some file -> file
+                    | None -> currentGame.LocalBannerPath
+
+                if not (String.IsNullOrWhiteSpace(path)) && File.Exists(path) then
+                    use stream = File.OpenRead(path)
                     // Decoding at card width keeps an extracted icon as sharp as
                     // its source allows instead of scaling a thumbnail up later.
                     let bmp = Bitmap.DecodeToWidth(stream, 432)
                     isVerticalCover <- (bmp.Size.Height > bmp.Size.Width && bmp.Size.Width >= 120.0)
                     bannerBitmap <- Some bmp
+                else
+                    fetchCover ()
             with _ ->
                 bannerBitmap <- None
 
@@ -72,7 +106,22 @@ type GameCardViewModel(game: GameItem) =
 
         this.RaisePropertyChanged("ExecutablePath")
 
-    /// Points the card at artwork the user picked themselves and redraws it.
+    /// Draws the card's artwork again, from whatever is on disk now.
+    member this.RefreshBanner() =
+        bannerBitmap <- None
+        isBitmapLoaded <- false
+        isVerticalCover <- false
+
+        this.RaisePropertyChanged("BannerImage")
+        this.RaisePropertyChanged("HasBannerImage")
+        this.RaisePropertyChanged("IsVerticalCover")
+        this.RaisePropertyChanged("IsAppIcon")
+
+    /// Whether this game is showing a cover the user picked.
+    member _.HasCustomCover = (GameScanner.customCoverPath currentGame).IsSome
+
+    /// Points the card at artwork found for it - the scanner's answer, not the
+    /// user's pick, which is a file and is found by `customCoverPath`.
     member this.SetBanner(path: string) =
         currentGame <- { currentGame with LocalBannerPath = path }
 

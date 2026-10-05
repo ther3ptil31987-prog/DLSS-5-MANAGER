@@ -1,4 +1,4 @@
-namespace DLSS_5_MANAGER.Services
+﻿namespace DLSS_5_MANAGER.Services
 
 open System
 open System.IO
@@ -19,19 +19,29 @@ module Localization =
 
     /// Display names stay in their own language: someone who cannot read the
     /// current UI language still has to be able to find their own.
+    ///
+    /// English first because it is what an unset app starts in and what every
+    /// missing string falls back to; the rest in one order that does not
+    /// change - alphabetical by the language's English name - so a list of
+    /// seventeen can be scanned instead of read.
     let availableLanguages =
         [| "en", "English"
-           "ar", "العربية"
-           "fa", "فارسی"
-           "tr", "Türkçe"
-           "es", "Español"
-           "ru", "Русский"
-           "uk", "Українська"
-           "fr", "Français"
-           "de", "Deutsch"
+           "ar", "العربية"        // Arabic
+           "zh", "中文"            // Chinese
+           "fr", "Français"       // French
+           "de", "Deutsch"        // German
+           "hi", "हिन्दी"           // Hindi
+           "id", "Bahasa Indonesia"
            "it", "Italiano"
-           "pt", "Português"
-           "zh", "中文" |]
+           "ja", "日本語"          // Japanese
+           "ko", "한국어"          // Korean
+           "fa", "فارسی"          // Persian
+           "pt", "Português"      // Portuguese
+           "ru", "Русский"        // Russian
+           "es", "Español"        // Spanish
+           "tr", "Türkçe"         // Turkish
+           "uk", "Українська"     // Ukrainian
+           "vi", "Tiếng Việt" |]
 
     let private empty = Dictionary<string, string>() :> IReadOnlyDictionary<string, string>
 
@@ -194,6 +204,124 @@ module Localization =
         member _.BtnAttachImage = get "btn_attach_image"
         member _.BtnDelete = get "btn_delete"
         member _.CommunityTabGames = get "community_tab_games"
+
+
+        // ---- LIVE FLOW ---------------------------------------------------
+        // Supplied as one translated set and placed here under the app's own
+        // key scheme, prefixed so none of it can collide with a name the rest
+        // of the interface already owns.
+        member _.LfProcessing = get "lf_processing"
+        member _.LfDlss5 = get "lf_dlss_5"
+        member _.LfDlss45Fg = get "lf_dlss_4_5_fg"
+        member _.LfOff = get "lf_off"
+        member _.LfOn = get "lf_on"
+        member _.LfEnhance = get "lf_enhance"
+        member _.LfMultiPass = get "lf_multi_pass"
+        member _.LfHaloReduction = get "lf_halo_reduction"
+        member _.LfHaloHint = get "lf_halo_hint"
+        member _.LfSharpness = get "lf_sharpness"
+        member _.LfSharpnessHint = get "lf_sharpness_hint"
+        member _.LfColors = get "lf_colors"
+        member _.LfBrightness = get "lf_brightness"
+        member _.LfContrast = get "lf_contrast"
+        member _.LfSaturation = get "lf_saturation"
+        member _.LfWarmth = get "lf_warmth"
+        member _.LfColorsReset = get "lf_colors_reset"
+        member _.LfMotionGpu = get "lf_motion_gpu"
+        member _.LfMotionCpu = get "lf_motion_cpu"
+        member _.LfEdgeSmoothing = get "lf_edge_smoothing"
+        member _.LfEdgeSmoothingHint = get "lf_edge_smoothing_hint"
+        member _.LfFlowMfg = get "lf_flow_mfg"
+        member _.LfFlowMfgHint = get "lf_flow_mfg_hint"
+        member _.LfFgBlockedHint = get "lf_fg_blocked_hint"
+        member _.LfStop = get "lf_stop"
+        member _.LfStopHint = get "lf_stop_hint"
+        member _.LfStart = get "lf_start"
+        member _.LfStartHint = get "lf_start_hint"
+
+        // ---- The community, seen from the Manage sheet -------------------
+        member _.CommunityGlanceNone = get "community_glance_none"
+        member _.CommunityGlanceWorked = get "community_glance_worked"
+        member _.CommunityGlanceMixed = get "community_glance_mixed"
+        member _.CommunityGlanceFailed = get "community_glance_failed"
+        member _.CommunityGlanceOpen = get "community_glance_open"
+        member _.CommunityGlanceHint = get "community_glance_hint"
+        member _.CommunityGlanceRefresh = get "community_glance_refresh"
+        member _.CommunityGlanceRefreshHint = get "community_glance_refresh_hint"
+        member _.LfNetworkResolution = get "lf_network_resolution"
+        member _.LfFast = get "lf_fast"
+        member _.LfBalanced = get "lf_balanced"
+        member _.LfQuality = get "lf_quality"
+        member _.LfSource = get "lf_source"
+        member _.LfRefresh = get "lf_refresh"
+        member _.LfReconnect = get "lf_reconnect"
+        member _.LfSelectAWindow = get "lf_select_a_window"
+        member _.LfGoToApp = get "lf_go_to_app"
+        member _.LfClear = get "lf_clear"
+        member _.LfEffect = get "lf_effect"
+        member _.LfProfile = get "lf_profile"
+        member _.LfModel = get "lf_model"
+        member _.LfIntensity = get "lf_intensity"
+        member _.LfLocalTone = get "lf_local_tone"
+        member _.LfLocalStructure = get "lf_local_structure"
+        member _.LfSkinStructure = get "lf_skin_structure"
+        member _.LfComparison = get "lf_comparison"
+        member _.LfBeforeAfterWipe = get "lf_before_after_wipe"
+        member _.LfMyPresets = get "lf_my_presets"
+        member _.LfPresetName = get "lf_preset_name"
+        member _.LfSavedPresets = get "lf_saved_presets"
+        member _.LfNameYourPreset = get "lf_name_your_preset"
+        member _.LfChooseAPreset = get "lf_choose_a_preset"
+        member _.LfSaveNew = get "lf_save_new"
+        member _.LfUpdateSelected = get "lf_update_selected"
+        member _.LfApply = get "lf_apply"
+        member _.LfDelete = get "lf_delete"
+        member _.LfSettings = get "lf_settings"
+        member _.LfProcessingGpu = get "lf_processing_gpu"
+        member _.LfDisplay = get "lf_display"
+        member _.LfMotionEstimation = get "lf_motion_estimation"
+        member _.LfSkipStaticFrames = get "lf_skip_static_frames"
+        member _.LfHdrCompatibility = get "lf_hdr_compatibility"
+        member _.LfCapture = get "lf_capture"
+        member _.LfMicrophone = get "lf_microphone"
+        member _.LfRecordingRate = get "lf_recording_rate"
+        member _.LfSystemAudio = get "lf_system_audio"
+        member _.LfChooseFolder = get "lf_choose_folder"
+        member _.LfScreenshot = get "lf_screenshot"
+        member _.LfRecord = get "lf_record"
+        member _.LfObsOutputSpout2 = get "lf_obs_output_spout2"
+        member _.LfObsHelp = get "lf_obs_help"
+        member _.LfGetObsSpout2Plugin = get "lf_get_obs_spout2_plugin"
+        member _.LfNone = get "lf_none"
+        member _.LfForCreators = get "lf_for_creators"
+        member _.LfObsGuide = get "lf_obs_guide"
+        member _.LfObsGuideTitle = get "lf_obs_guide_title"
+        member _.LfObsSteps = get "lf_obs_steps"
+        member _.LfShortcutOverlay = get "lf_shortcut_overlay"
+        member _.LfFpsOn = get "lf_fps_on"
+        member _.LfFpsOff = get "lf_fps_off"
+        member _.LfFpsBase = get "lf_fps_base"
+        member _.LfFpsHint = get "lf_fps_hint"
+        member _.LfShortcutHintOverlay = get "lf_shortcut_hint_overlay"
+        member _.LfShortcutDlss = get "lf_shortcut_dlss"
+        member _.LfShortcutHintDlss = get "lf_shortcut_hint_dlss"
+        member _.LfShortcutListening = get "lf_shortcut_listening"
+        member _.LfShortcutPresets = get "lf_shortcut_presets"
+        member _.LfShortcutChange = get "lf_shortcut_change"
+        member _.LfOpenOverlayNow = get "lf_open_overlay_now"
+        // ---- The gallery -------------------------------------------------
+        member _.GalleryTitle = get "gallery_title"
+        member _.GalleryTagline = get "gallery_tagline"
+        member _.GalleryWall = get "gallery_wall"
+        member _.GalleryQueue = get "gallery_queue"
+        member _.GalleryUpload = get "gallery_upload"
+        member _.GalleryCaption = get "gallery_caption"
+        member _.GalleryEmpty = get "gallery_empty"
+        member _.GalleryQueueEmpty = get "gallery_queue_empty"
+        member _.GalleryApprove = get "gallery_approve"
+        member _.GalleryReject = get "gallery_reject"
+        member _.GalleryPromote = get "gallery_promote"
+        member _.GalleryModeration = get "gallery_moderation"
         member _.FilterRoute = get "filter_route"
         member _.FilterResult = get "filter_result"
         member _.FilterSort = get "filter_sort"
@@ -233,9 +361,96 @@ module Localization =
         member _.OverlayStyle = get "overlay_style"
         member _.OverlayHotkey = get "overlay_hotkey"
         member _.OverlayHotkeyDesc = get "overlay_hotkey_desc"
+        member _.OptiMenuKey = get "opti_menu_key"
+        member _.OptiMenuKeyTitle = get "opti_menu_key_title"
+        member _.OptiMenuKeyDesc = get "opti_menu_key_desc"
         member _.Extras = get "extras"
         member _.ExtrasDesc = get "extras_desc"
         member _.BtnAddExtra = get "btn_add_extra"
+
+        // ---- Downloads sheet (CloudAssets) ----------------------------------
+        member _.AssetsTitle = get "assets_title"
+        member _.AssetsSubtitle = get "assets_subtitle"
+        member _.AssetsButtonTip = get "assets_button_tip"
+        member _.AssetsAllReady = get "assets_all_ready"
+        member _.AssetsDownloadAll = get "assets_download_all"
+        member _.AssetsLater = get "assets_later"
+        member _.AssetsDone = get "assets_done"
+        member _.AssetOverlayBlurb = get "asset_overlay_blurb"
+        member _.AssetXessBlurb = get "asset_xess_blurb"
+        member _.AssetNotDownloaded = get "asset_not_downloaded"
+        member _.AssetReady = get "asset_ready"
+        member _.AssetStarting = get "asset_starting"
+        member _.AssetFailed = get "asset_failed"
+        member _.AssetMisplaced = get "asset_misplaced"
+        member _.AssetDownload = get "asset_download"
+        member _.AssetDownloading = get "asset_downloading"
+        member _.AssetRetry = get "asset_retry"
+        member _.OverlayLocked = get "overlay_locked"
+        member _.AntiCheatTitle = get "anti_cheat_title"
+        member _.AntiCheatWarning = get "anti_cheat_warning"
+        member _.OverlayLockedDesc = get "overlay_locked_desc"
+
+        // ---- Manage sheet: key bindings --------------------------------------
+        member _.KeysSection = get "keys_section"
+        member _.KeysSectionDesc = get "keys_section_desc"
+        member _.DllNameSection = get "dll_name_section"
+        member _.DllNameToggle = get "dll_name_toggle"
+        member _.DllNameDesc = get "dll_name_desc"
+        member _.DllNameCustom = get "dll_name_custom"
+        member _.DllNameApply = get "dll_name_apply"
+        member _.DllNameCurrent = get "dll_name_current"
+        member _.DllNameInstallFirst = get "dll_name_install_first"
+        member _.DllNamePlaceholder = get "dll_name_placeholder"
+        member _.DllNameTaken = get "dll_name_taken"
+        member _.DownloadsHintTitle = get "downloads_hint_title"
+        member _.DownloadsHintText = get "downloads_hint_text"
+        member _.ManageRescanTip = get "manage_rescan_tip"
+        member _.ManageInstallingTip = get "manage_installing_tip"
+        member _.ManageShowDetails = get "manage_show_details"
+        member _.ManageDlss5Status = get "manage_dlss5_status"
+        member _.ManageAskingCommunity = get "manage_asking_community"
+        member _.ManageShipsDlssTip = get "manage_ships_dlss_tip"
+        member _.RouteRecommendedTip = get "route_recommended_tip"
+        member _.RouteDx12Tip = get "route_dx12_tip"
+        member _.RouteDx11Tip = get "route_dx11_tip"
+        member _.RouteDx9Tip = get "route_dx9_tip"
+        member _.RouteVulkanTip = get "route_vulkan_tip"
+        member _.OptiDx12Tip = get "opti_dx12_tip"
+        member _.OptiVulkanTip = get "opti_vulkan_tip"
+        member _.Arch32Tip = get "arch_32_tip"
+        member _.AmdModeNotice = get "amd_mode_notice"
+        member _.TipNeural = get "tip_neural"
+        member _.TipMfgUnlock = get "tip_mfgunlock"
+        member _.TipMultipass = get "tip_multipass"
+        member _.TipDeepFried = get "tip_deepfried"
+        member _.TipDeepFriedVulkan = get "tip_deepfried_vulkan"
+        member _.TipDeepFriedHost64 = get "tip_deepfried_host64"
+        member _.TipOverlay = get "tip_overlay"
+        member _.EmuDxTip = get "emu_dx_tip"
+        member _.EmuVulkanTip = get "emu_vulkan_tip"
+        member _.EmuApiHint = get "emu_api_hint"
+        member _.ChangeExeTip = get "change_exe_tip"
+        member _.KeyOpenReShadeWith = get "key_open_reshade_with"
+        member _.KeyOpenOverlayWith = get "key_open_overlay_with"
+        member _.HintRouteOptiScaler = get "hint_route_optiscaler"
+        member _.HintRouteRenoDx = get "hint_route_renodx"
+        member _.HintRouteVulkan = get "hint_route_vulkan"
+        member _.HintRouteDx9 = get "hint_route_dx9"
+        member _.HintRouteEmulator = get "hint_route_emulator"
+        member _.HintRouteAmd = get "hint_route_amd"
+        member _.DllNameVulkanLayer = get "dll_name_vulkan_layer"
+        member _.KeyOptiMenu = get "key_opti_menu"
+        member _.KeyReShade = get "key_reshade"
+        member _.KeyOverlay = get "key_overlay"
+        member _.KeyChange = get "key_change"
+
+        // ---- Settings: background ---------------------------------------------
+        member _.BackgroundBrightness = get "bg_brightness"
+        member _.BackgroundBrightnessDesc = get "bg_brightness_desc"
+        member _.BackgroundCustom = get "bg_custom"
+        member _.BackgroundCustomPick = get "bg_custom_pick"
+        member _.BackgroundCustomRemove = get "bg_custom_remove"
 
         // ---- Theme names --------------------------------------------------
         /// Same order as `MainViewModel.atmosphereKeys`; the English key is what
@@ -292,3 +507,11 @@ module Localization =
 
         member _.StatusGamesReady(count: int) =
             (get "status_games_ready").Replace("{count}", string count)
+
+    /// The strings the whole app is showing right now.
+    ///
+    /// MainViewModel owns the language and writes this whenever it changes, so
+    /// a view that is not bound to MainViewModel - LIVE FLOW and its overlay,
+    /// which carry their own view-model - can read the same set without it
+    /// being threaded through every constructor.
+    let mutable current = Strings("en")

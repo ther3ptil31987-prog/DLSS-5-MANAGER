@@ -9,6 +9,22 @@
     </Application.DataTemplates>
 
     <Application.Resources>
+        <!-- Glare: over a bright background picture the glass surfaces and the
+             text on them wash out. MainViewModel.ApplyGlare replaces these as
+             the picture or its brightness changes (BackgroundStore.glare); the
+             values here are the look over a dark picture, where they are the
+             surfaces exactly as they always were. -->
+        <SolidColorBrush x:Key="GlareVeilBrush" Color="Transparent" />
+        <SolidColorBrush x:Key="GlareCardBrush" Color="#08FFFFFF" />
+        <SolidColorBrush x:Key="GlareHeaderBrush" Color="#10FFFFFF" />
+        <SolidColorBrush x:Key="GlareScreenCardBrush" Color="#10000000" />
+        <SolidColorBrush x:Key="GlareBackingBrush" Color="Transparent" />
+        <LinearGradientBrush x:Key="GlareCapsuleBrush" StartPoint="0%,0%" EndPoint="100%,100%">
+            <GradientStop Color="#30FFFFFF" Offset="0.0" />
+            <GradientStop Color="#12FFFFFF" Offset="0.5" />
+            <GradientStop Color="#20FFFFFF" Offset="1.0" />
+        </LinearGradientBrush>
+
         <SolidColorBrush x:Key="ComboBoxDropDownBackground" Color="Transparent" />
         <SolidColorBrush x:Key="ComboBoxDropDownBackgroundPointerOver" Color="Transparent" />
         <SolidColorBrush x:Key="ComboBoxPopupBackground" Color="Transparent" />
@@ -30,6 +46,111 @@
         <SolidColorBrush x:Key="ToggleSwitchFillOff" Color="#18FFFFFF" />
         <SolidColorBrush x:Key="ToggleSwitchFillOffPointerOver" Color="#28FFFFFF" />
         <SolidColorBrush x:Key="ToggleSwitchStrokeOff" Color="#30FFFFFF" />
+
+        <!-- ============================================================= -->
+        <!-- PILL SLIDER - LIVE FLOW's bar, and Settings' brightness        -->
+        <!-- ============================================================= -->
+        <!-- The value is the bar, not a knob sitting on one: the fill is
+             rounded at both ends and where it stops is the setting, the way a
+             phone draws brightness.
+
+             The round end IS the thumb: 32 px, as wide as the bar is tall, so
+             the Track lays the fill out as ratio * (width - 32) + 32 - a
+             straight line from the lowest setting to the highest. The old bar
+             drew a fixed 32 px stub under a thumb 2 px wide: the first ~6 % of
+             every bar did not move at all, and near the bottom the fill was a
+             clipped rounded sliver on top of the stub, which is what looked
+             broken.
+
+             The pill is three plain shapes: a round start cap, a square from
+             its centre to the thumb's centre, and the round thumb. That is
+             exactly a pill at every value, including the lowest. -->
+        <SolidColorBrush x:Key="PillSliderFill" Color="#C3CDDB" />
+        <SolidColorBrush x:Key="PillSliderFillPointerOver" Color="#DCE4EE" />
+
+        <ControlTheme x:Key="PillSlider" TargetType="Slider">
+            <Setter Property="Height" Value="40" />
+            <Setter Property="Template">
+                <ControlTemplate>
+                    <Grid Margin="0,3" ClipToBounds="False">
+                        <!-- The groove -->
+                        <Border Height="32" CornerRadius="16" Background="#12FFFFFF" BorderBrush="#26FFFFFF" BorderThickness="1" />
+
+                        <!-- The start cap: the fill's rounded beginning, always there.
+                             At the lowest setting the thumb sits exactly on it. -->
+                        <Border Name="PART_StartCap" Width="32" Height="32" CornerRadius="16" HorizontalAlignment="Left"
+                                Background="{DynamicResource PillSliderFill}" />
+
+                        <Track Name="PART_Track" Orientation="Horizontal" ClipToBounds="False"
+                               Minimum="{TemplateBinding Minimum}" Maximum="{TemplateBinding Maximum}"
+                               Value="{TemplateBinding Value, Mode=TwoWay}">
+                            <!-- Neither half of the track is hit-testable: a press
+                                 anywhere on the bar moves the value to it. -->
+                            <Track.DecreaseButton>
+                                <RepeatButton Name="PART_DecreaseButton" Focusable="False" IsHitTestVisible="False"
+                                              HorizontalAlignment="Stretch" Padding="0" BorderThickness="0"
+                                              ClipToBounds="False"
+                                              Background="{DynamicResource PillSliderFill}">
+                                    <RepeatButton.Template>
+                                        <ControlTemplate>
+                                            <!-- Square, and shifted half a thumb right: it runs from the
+                                                 centre of the start cap to the centre of the thumb. A
+                                                 render offset, because layout will not let the button
+                                                 grow past the width the track gives it. -->
+                                            <Border Height="32" Background="{TemplateBinding Background}"
+                                                    RenderTransform="translate(16px,0px)" />
+                                        </ControlTemplate>
+                                    </RepeatButton.Template>
+                                </RepeatButton>
+                            </Track.DecreaseButton>
+
+                            <Track.Thumb>
+                                <Thumb Name="PART_Thumb" Width="32" Height="32" ZIndex="1"
+                                       Background="{DynamicResource PillSliderFill}">
+                                    <Thumb.Template>
+                                        <ControlTemplate>
+                                            <Border Background="{TemplateBinding Background}" CornerRadius="16">
+                                                <StackPanel Orientation="Horizontal" Spacing="3"
+                                                            HorizontalAlignment="Center" VerticalAlignment="Center">
+                                                    <Ellipse Width="3" Height="3" Fill="#4D0B1214" />
+                                                    <Ellipse Width="3" Height="3" Fill="#4D0B1214" />
+                                                    <Ellipse Width="3" Height="3" Fill="#4D0B1214" />
+                                                </StackPanel>
+                                            </Border>
+                                        </ControlTemplate>
+                                    </Thumb.Template>
+                                </Thumb>
+                            </Track.Thumb>
+
+                            <Track.IncreaseButton>
+                                <RepeatButton Name="PART_IncreaseButton" Focusable="False" IsHitTestVisible="False"
+                                              HorizontalAlignment="Stretch" Padding="0" BorderThickness="0">
+                                    <RepeatButton.Template>
+                                        <ControlTemplate>
+                                            <Border Background="Transparent" />
+                                        </ControlTemplate>
+                                    </RepeatButton.Template>
+                                </RepeatButton>
+                            </Track.IncreaseButton>
+                        </Track>
+                    </Grid>
+                </ControlTemplate>
+            </Setter>
+
+            <!-- Touching it brightens the fill, so the bar answers the hand. -->
+            <Style Selector="^:pointerover /template/ RepeatButton#PART_DecreaseButton">
+                <Setter Property="Background" Value="{DynamicResource PillSliderFillPointerOver}" />
+            </Style>
+            <Style Selector="^:pointerover /template/ Border#PART_StartCap">
+                <Setter Property="Background" Value="{DynamicResource PillSliderFillPointerOver}" />
+            </Style>
+            <Style Selector="^:pointerover /template/ Thumb#PART_Thumb">
+                <Setter Property="Background" Value="{DynamicResource PillSliderFillPointerOver}" />
+            </Style>
+            <Style Selector="^:disabled">
+                <Setter Property="Opacity" Value="0.45" />
+            </Style>
+        </ControlTheme>
     </Application.Resources>
 
     <Application.Styles>
@@ -833,234 +954,9 @@
         </Style>
 
         <!-- ================================================================= -->
-        <!-- FLOATING BACKGROUND ATMOSPHERIC ANIMATIONS                        -->
+        <!-- STATIC BACKGROUNDS — NO CONTINUOUS ANIMATION                        -->
         <!-- ================================================================= -->
-        <Style Selector="Panel.Motion Border.FloatOrb1">
-            <Style.Animations>
-                <Animation Duration="0:0:16.0" IterationCount="Infinite" Easing="SineEaseInOut">
-                    <KeyFrame Cue="0%">
-                        <Setter Property="TranslateTransform.X" Value="0" />
-                        <Setter Property="TranslateTransform.Y" Value="0" />
-                    </KeyFrame>
-                    <KeyFrame Cue="25%">
-                        <Setter Property="TranslateTransform.X" Value="45" />
-                        <Setter Property="TranslateTransform.Y" Value="-35" />
-                    </KeyFrame>
-                    <KeyFrame Cue="50%">
-                        <Setter Property="TranslateTransform.X" Value="20" />
-                        <Setter Property="TranslateTransform.Y" Value="40" />
-                    </KeyFrame>
-                    <KeyFrame Cue="75%">
-                        <Setter Property="TranslateTransform.X" Value="-35" />
-                        <Setter Property="TranslateTransform.Y" Value="-20" />
-                    </KeyFrame>
-                    <KeyFrame Cue="100%">
-                        <Setter Property="TranslateTransform.X" Value="0" />
-                        <Setter Property="TranslateTransform.Y" Value="0" />
-                    </KeyFrame>
-                </Animation>
-            </Style.Animations>
-        </Style>
-
-        <Style Selector="Panel.Motion Border.FloatOrb2">
-            <Style.Animations>
-                <Animation Duration="0:0:22.0" IterationCount="Infinite" Easing="SineEaseInOut">
-                    <KeyFrame Cue="0%">
-                        <Setter Property="TranslateTransform.X" Value="0" />
-                        <Setter Property="TranslateTransform.Y" Value="0" />
-                    </KeyFrame>
-                    <KeyFrame Cue="30%">
-                        <Setter Property="TranslateTransform.X" Value="-55" />
-                        <Setter Property="TranslateTransform.Y" Value="40" />
-                    </KeyFrame>
-                    <KeyFrame Cue="65%">
-                        <Setter Property="TranslateTransform.X" Value="30" />
-                        <Setter Property="TranslateTransform.Y" Value="-30" />
-                    </KeyFrame>
-                    <KeyFrame Cue="100%">
-                        <Setter Property="TranslateTransform.X" Value="0" />
-                        <Setter Property="TranslateTransform.Y" Value="0" />
-                    </KeyFrame>
-                </Animation>
-            </Style.Animations>
-        </Style>
-
-        <Style Selector="Panel.Motion Border.FloatOrb3">
-            <Style.Animations>
-                <Animation Duration="0:0:14.0" IterationCount="Infinite" Easing="SineEaseInOut">
-                    <KeyFrame Cue="0%">
-                        <Setter Property="TranslateTransform.X" Value="0" />
-                        <Setter Property="TranslateTransform.Y" Value="0" />
-                    </KeyFrame>
-                    <KeyFrame Cue="40%">
-                        <Setter Property="TranslateTransform.X" Value="30" />
-                        <Setter Property="TranslateTransform.Y" Value="35" />
-                    </KeyFrame>
-                    <KeyFrame Cue="80%">
-                        <Setter Property="TranslateTransform.X" Value="-25" />
-                        <Setter Property="TranslateTransform.Y" Value="-25" />
-                    </KeyFrame>
-                    <KeyFrame Cue="100%">
-                        <Setter Property="TranslateTransform.X" Value="0" />
-                        <Setter Property="TranslateTransform.Y" Value="0" />
-                    </KeyFrame>
-                </Animation>
-            </Style.Animations>
-        </Style>
-
-        <Style Selector="Panel.Motion Border.FloatAurora1">
-            <Style.Animations>
-                <Animation Duration="0:0:18.0" IterationCount="Infinite" Easing="SineEaseInOut">
-                    <KeyFrame Cue="0%">
-                        <Setter Property="TranslateTransform.X" Value="-60" />
-                        <Setter Property="TranslateTransform.Y" Value="0" />
-                        <Setter Property="Opacity" Value="0.22" />
-                    </KeyFrame>
-                    <KeyFrame Cue="50%">
-                        <Setter Property="TranslateTransform.X" Value="60" />
-                        <Setter Property="TranslateTransform.Y" Value="-40" />
-                        <Setter Property="Opacity" Value="0.45" />
-                    </KeyFrame>
-                    <KeyFrame Cue="100%">
-                        <Setter Property="TranslateTransform.X" Value="-60" />
-                        <Setter Property="TranslateTransform.Y" Value="0" />
-                        <Setter Property="Opacity" Value="0.22" />
-                    </KeyFrame>
-                </Animation>
-            </Style.Animations>
-        </Style>
-
-        <Style Selector="Panel.Motion Border.FloatAurora2">
-            <Style.Animations>
-                <Animation Duration="0:0:24.0" IterationCount="Infinite" Easing="SineEaseInOut">
-                    <KeyFrame Cue="0%">
-                        <Setter Property="TranslateTransform.X" Value="80" />
-                        <Setter Property="TranslateTransform.Y" Value="20" />
-                        <Setter Property="Opacity" Value="0.18" />
-                    </KeyFrame>
-                    <KeyFrame Cue="50%">
-                        <Setter Property="TranslateTransform.X" Value="-70" />
-                        <Setter Property="TranslateTransform.Y" Value="-30" />
-                        <Setter Property="Opacity" Value="0.38" />
-                    </KeyFrame>
-                    <KeyFrame Cue="100%">
-                        <Setter Property="TranslateTransform.X" Value="80" />
-                        <Setter Property="TranslateTransform.Y" Value="20" />
-                        <Setter Property="Opacity" Value="0.18" />
-                    </KeyFrame>
-                </Animation>
-            </Style.Animations>
-        </Style>
-
-        <Style Selector="Panel.Motion Border.FloatCrystal1">
-            <Style.Animations>
-                <Animation Duration="0:0:22.0" IterationCount="Infinite" Easing="SineEaseInOut">
-                    <KeyFrame Cue="0%">
-                        <Setter Property="TranslateTransform.X" Value="0" />
-                        <Setter Property="TranslateTransform.Y" Value="0" />
-                        <Setter Property="RotateTransform.Angle" Value="0" />
-                    </KeyFrame>
-                    <KeyFrame Cue="50%">
-                        <Setter Property="TranslateTransform.X" Value="35" />
-                        <Setter Property="TranslateTransform.Y" Value="-35" />
-                        <Setter Property="RotateTransform.Angle" Value="180" />
-                    </KeyFrame>
-                    <KeyFrame Cue="100%">
-                        <Setter Property="TranslateTransform.X" Value="0" />
-                        <Setter Property="TranslateTransform.Y" Value="0" />
-                        <Setter Property="RotateTransform.Angle" Value="360" />
-                    </KeyFrame>
-                </Animation>
-            </Style.Animations>
-        </Style>
-
-        <Style Selector="Panel.Motion Border.FloatCrystal2">
-            <Style.Animations>
-                <Animation Duration="0:0:18.0" IterationCount="Infinite" Easing="SineEaseInOut">
-                    <KeyFrame Cue="0%">
-                        <Setter Property="TranslateTransform.X" Value="0" />
-                        <Setter Property="TranslateTransform.Y" Value="0" />
-                        <Setter Property="RotateTransform.Angle" Value="360" />
-                    </KeyFrame>
-                    <KeyFrame Cue="50%">
-                        <Setter Property="TranslateTransform.X" Value="-30" />
-                        <Setter Property="TranslateTransform.Y" Value="25" />
-                        <Setter Property="RotateTransform.Angle" Value="180" />
-                    </KeyFrame>
-                    <KeyFrame Cue="100%">
-                        <Setter Property="TranslateTransform.X" Value="0" />
-                        <Setter Property="TranslateTransform.Y" Value="0" />
-                        <Setter Property="RotateTransform.Angle" Value="0" />
-                    </KeyFrame>
-                </Animation>
-            </Style.Animations>
-        </Style>
-
-        <Style Selector="Panel.Motion Border.FloatParticle1">
-            <Style.Animations>
-                <Animation Duration="0:0:10.0" IterationCount="Infinite" Easing="SineEaseInOut">
-                    <KeyFrame Cue="0%">
-                        <Setter Property="TranslateTransform.Y" Value="0" />
-                        <Setter Property="TranslateTransform.X" Value="0" />
-                        <Setter Property="Opacity" Value="0.2" />
-                    </KeyFrame>
-                    <KeyFrame Cue="50%">
-                        <Setter Property="TranslateTransform.Y" Value="-45" />
-                        <Setter Property="TranslateTransform.X" Value="20" />
-                        <Setter Property="Opacity" Value="0.65" />
-                    </KeyFrame>
-                    <KeyFrame Cue="100%">
-                        <Setter Property="TranslateTransform.Y" Value="0" />
-                        <Setter Property="TranslateTransform.X" Value="0" />
-                        <Setter Property="Opacity" Value="0.2" />
-                    </KeyFrame>
-                </Animation>
-            </Style.Animations>
-        </Style>
-
-        <Style Selector="Panel.Motion Border.FloatParticle2">
-            <Style.Animations>
-                <Animation Duration="0:0:13.0" IterationCount="Infinite" Easing="SineEaseInOut">
-                    <KeyFrame Cue="0%">
-                        <Setter Property="TranslateTransform.Y" Value="0" />
-                        <Setter Property="TranslateTransform.X" Value="0" />
-                        <Setter Property="Opacity" Value="0.3" />
-                    </KeyFrame>
-                    <KeyFrame Cue="50%">
-                        <Setter Property="TranslateTransform.Y" Value="-60" />
-                        <Setter Property="TranslateTransform.X" Value="-25" />
-                        <Setter Property="Opacity" Value="0.75" />
-                    </KeyFrame>
-                    <KeyFrame Cue="100%">
-                        <Setter Property="TranslateTransform.Y" Value="0" />
-                        <Setter Property="TranslateTransform.X" Value="0" />
-                        <Setter Property="Opacity" Value="0.3" />
-                    </KeyFrame>
-                </Animation>
-            </Style.Animations>
-        </Style>
-
-        <Style Selector="Panel.Motion Border.FloatFlux1">
-            <Style.Animations>
-                <Animation Duration="0:0:12.0" IterationCount="Infinite" Easing="SineEaseInOut">
-                    <KeyFrame Cue="0%">
-                        <Setter Property="TranslateTransform.X" Value="-120" />
-                        <Setter Property="Opacity" Value="0.08" />
-                    </KeyFrame>
-                    <KeyFrame Cue="50%">
-                        <Setter Property="TranslateTransform.X" Value="120" />
-                        <Setter Property="Opacity" Value="0.4" />
-                    </KeyFrame>
-                    <KeyFrame Cue="100%">
-                        <Setter Property="TranslateTransform.X" Value="-120" />
-                        <Setter Property="Opacity" Value="0.08" />
-                    </KeyFrame>
-                </Animation>
-            </Style.Animations>
-        </Style>
-
-
-        <!-- Slim Glass Overlay Scroller (Minimal macOS Scrollbar) -->
+<!-- Slim Glass Overlay Scroller (Minimal macOS Scrollbar) -->
         <Style Selector="ScrollBar:vertical">
             <Setter Property="Width" Value="10" />
             <Setter Property="Background" Value="Transparent" />
@@ -1542,6 +1438,372 @@
             <Setter Property="BorderBrush" Value="#35FFFFFF" />
             <Setter Property="BorderThickness" Value="1.5" />
             <Setter Property="CornerRadius" Value="16" />
+        </Style>
+
+        <!-- ================================================================= -->
+        <!-- DOWNLOADS (CloudAssets)                                            -->
+        <!-- ================================================================= -->
+
+        <!-- The round button beside the tabs. Its colours go on the
+             ContentPresenter: in this theme that is what draws a button's
+             background, and Fluent repaints it on hover. -->
+        <Style Selector="Button.AssetsBadgeBtn">
+            <Setter Property="Focusable" Value="False" />
+            <Setter Property="Padding" Value="0" />
+            <Setter Property="CornerRadius" Value="18" />
+            <Setter Property="BorderThickness" Value="1" />
+            <Setter Property="Transitions">
+                <Transitions>
+                    <TransformOperationsTransition Property="RenderTransform" Duration="0:0:0.15" />
+                </Transitions>
+            </Setter>
+        </Style>
+
+        <Style Selector="Button.AssetsBadgeBtn /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="CornerRadius" Value="18" />
+            <Setter Property="BorderBrush" Value="#4535D22B" />
+            <Setter Property="Background">
+                <LinearGradientBrush StartPoint="0%,0%" EndPoint="100%,100%">
+                    <GradientStop Color="#302FCB6A" Offset="0.0" />
+                    <GradientStop Color="#12FFFFFF" Offset="0.5" />
+                    <GradientStop Color="#20FFFFFF" Offset="1.0" />
+                </LinearGradientBrush>
+            </Setter>
+        </Style>
+
+        <Style Selector="Button.AssetsBadgeBtn:pointerover">
+            <Setter Property="RenderTransform" Value="scale(1.06)" />
+        </Style>
+
+        <Style Selector="Button.AssetsBadgeBtn:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="BorderBrush" Value="#8035D22B" />
+            <Setter Property="Background">
+                <LinearGradientBrush StartPoint="0%,0%" EndPoint="100%,100%">
+                    <GradientStop Color="#5035D22B" Offset="0.0" />
+                    <GradientStop Color="#1C35D22B" Offset="1.0" />
+                </LinearGradientBrush>
+            </Setter>
+        </Style>
+
+        <!-- Turns only while a download is running: the class is bound to
+             that, so nothing animates the rest of the time. -->
+        <Style Selector="Ellipse.AssetsSpin.Busy">
+            <Style.Animations>
+                <Animation Duration="0:0:1.1" IterationCount="Infinite">
+                    <KeyFrame Cue="0%">
+                        <Setter Property="RotateTransform.Angle" Value="0" />
+                    </KeyFrame>
+                    <KeyFrame Cue="100%">
+                        <Setter Property="RotateTransform.Angle" Value="360" />
+                    </KeyFrame>
+                </Animation>
+            </Style.Animations>
+        </Style>
+
+        <!-- The green action in the Downloads sheet (and the lock's way out in
+             the Manage sheet). Painted on the presenter for the reason above;
+             the text colour is held there too, or Fluent turns it white on hover. -->
+        <Style Selector="Button.AssetPrimaryBtn">
+            <Setter Property="Focusable" Value="False" />
+            <Setter Property="BorderThickness" Value="0" />
+            <Setter Property="CornerRadius" Value="11" />
+            <Setter Property="Padding" Value="18,7" />
+            <Setter Property="FontWeight" Value="Bold" />
+            <Setter Property="FontSize" Value="11.5" />
+            <Setter Property="HorizontalContentAlignment" Value="Center" />
+            <Setter Property="VerticalContentAlignment" Value="Center" />
+            <Setter Property="Transitions">
+                <Transitions>
+                    <TransformOperationsTransition Property="RenderTransform" Duration="0:0:0.15" />
+                </Transitions>
+            </Setter>
+        </Style>
+
+        <Style Selector="Button.AssetPrimaryBtn.Small">
+            <Setter Property="Padding" Value="12,4" />
+            <Setter Property="FontSize" Value="10.5" />
+            <Setter Property="CornerRadius" Value="10" />
+        </Style>
+
+        <Style Selector="Button.AssetPrimaryBtn.Large">
+            <Setter Property="Padding" Value="22,10" />
+            <Setter Property="FontSize" Value="12" />
+            <Setter Property="CornerRadius" Value="12" />
+        </Style>
+
+        <Style Selector="Button.AssetPrimaryBtn /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="Foreground" Value="#06170A" />
+            <Setter Property="Background">
+                <LinearGradientBrush StartPoint="0%,0%" EndPoint="100%,100%">
+                    <GradientStop Color="#4AE840" Offset="0.0" />
+                    <GradientStop Color="#2BB023" Offset="1.0" />
+                </LinearGradientBrush>
+            </Setter>
+        </Style>
+
+        <Style Selector="Button.AssetPrimaryBtn:pointerover">
+            <Setter Property="RenderTransform" Value="scale(1.03)" />
+        </Style>
+
+        <Style Selector="Button.AssetPrimaryBtn:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="Foreground" Value="#06170A" />
+            <Setter Property="Background">
+                <LinearGradientBrush StartPoint="0%,0%" EndPoint="100%,100%">
+                    <GradientStop Color="#63F559" Offset="0.0" />
+                    <GradientStop Color="#35C22B" Offset="1.0" />
+                </LinearGradientBrush>
+            </Setter>
+        </Style>
+
+        <Style Selector="Button.AssetPrimaryBtn:pressed /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="Foreground" Value="#06170A" />
+            <Setter Property="Background" Value="#2BB023" />
+        </Style>
+
+        <Style Selector="Button.AssetPrimaryBtn:disabled /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="Foreground" Value="#6B7F71" />
+            <Setter Property="Background" Value="#16211A" />
+        </Style>
+
+        <Style Selector="ProgressBar.AssetBar">
+            <Setter Property="Height" Value="6" />
+            <Setter Property="MinHeight" Value="6" />
+            <Setter Property="CornerRadius" Value="3" />
+            <Setter Property="Background" Value="#16FFFFFF" />
+            <Setter Property="Foreground">
+                <LinearGradientBrush StartPoint="0%,0%" EndPoint="100%,0%">
+                    <GradientStop Color="#35D22B" Offset="0.0" />
+                    <GradientStop Color="#00FF88" Offset="1.0" />
+                </LinearGradientBrush>
+            </Setter>
+        </Style>
+
+        <Style Selector="Border.AssetCard">
+            <Setter Property="CornerRadius" Value="18" />
+            <Setter Property="Padding" Value="18,16" />
+            <Setter Property="BorderThickness" Value="1" />
+            <Setter Property="BorderBrush" Value="#1EFFFFFF" />
+            <Setter Property="Background">
+                <LinearGradientBrush StartPoint="0%,0%" EndPoint="100%,100%">
+                    <GradientStop Color="#12FFFFFF" Offset="0.0" />
+                    <GradientStop Color="#05FFFFFF" Offset="1.0" />
+                </LinearGradientBrush>
+            </Setter>
+            <Setter Property="Transitions">
+                <Transitions>
+                    <BrushTransition Property="BorderBrush" Duration="0:0:0.25" />
+                </Transitions>
+            </Setter>
+        </Style>
+
+        <Style Selector="Border.AssetCard.Ready">
+            <Setter Property="BorderBrush" Value="#4535D22B" />
+            <Setter Property="Background">
+                <LinearGradientBrush StartPoint="0%,0%" EndPoint="100%,100%">
+                    <GradientStop Color="#1635D22B" Offset="0.0" />
+                    <GradientStop Color="#0535D22B" Offset="1.0" />
+                </LinearGradientBrush>
+            </Setter>
+        </Style>
+
+        <Style Selector="Border.AssetIcon">
+            <Setter Property="Width" Value="52" />
+            <Setter Property="Height" Value="52" />
+            <Setter Property="CornerRadius" Value="15" />
+            <Setter Property="BorderThickness" Value="1" />
+            <Setter Property="BorderBrush" Value="#4035D22B" />
+            <Setter Property="Background">
+                <LinearGradientBrush StartPoint="0%,0%" EndPoint="100%,100%">
+                    <GradientStop Color="#2C35D22B" Offset="0.0" />
+                    <GradientStop Color="#0800FF88" Offset="1.0" />
+                </LinearGradientBrush>
+            </Setter>
+        </Style>
+
+        <!-- ================================================================= -->
+        <!-- MANAGE SHEET: ANTI-CHEAT MARK                                      -->
+        <!-- ================================================================= -->
+        <!-- The same glass as the rescan button beside it (GlassWindowControlBtn);
+             only the "!" is amber, so it still reads as a warning. Painted on the
+             presenter, like every coloured button here. -->
+        <Style Selector="Button.AntiCheatBadge">
+            <Setter Property="Focusable" Value="False" />
+            <Setter Property="Width" Value="28" />
+            <Setter Property="Height" Value="28" />
+            <Setter Property="Padding" Value="0" />
+            <Setter Property="CornerRadius" Value="9" />
+            <Setter Property="BorderThickness" Value="0" />
+            <Setter Property="HorizontalContentAlignment" Value="Center" />
+            <Setter Property="VerticalContentAlignment" Value="Center" />
+            <Setter Property="Transitions">
+                <Transitions>
+                    <TransformOperationsTransition Property="RenderTransform" Duration="0:0:0.15" />
+                </Transitions>
+            </Setter>
+        </Style>
+
+        <Style Selector="Button.AntiCheatBadge /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="Background" Value="#1CFFFFFF" />
+            <Setter Property="BorderBrush" Value="#30FFFFFF" />
+            <Setter Property="BorderThickness" Value="1" />
+            <Setter Property="CornerRadius" Value="9" />
+            <Setter Property="Transitions">
+                <Transitions>
+                    <BrushTransition Property="Background" Duration="0:0:0.15" />
+                    <BrushTransition Property="BorderBrush" Duration="0:0:0.15" />
+                </Transitions>
+            </Setter>
+        </Style>
+
+        <Style Selector="Button.AntiCheatBadge:pointerover">
+            <Setter Property="RenderTransform" Value="scale(1.05)" />
+        </Style>
+
+        <Style Selector="Button.AntiCheatBadge:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="Background" Value="#30FFFFFF" />
+            <Setter Property="BorderBrush" Value="#66FCD34D" />
+        </Style>
+
+        <!-- ================================================================= -->
+        <!-- MANAGE SHEET: CHANGE KEY                                           -->
+        <!-- ================================================================= -->
+        <Style Selector="Border.KeyRow">
+            <Setter Property="Background" Value="#08FFFFFF" />
+            <Setter Property="BorderBrush" Value="#14FFFFFF" />
+            <Setter Property="BorderThickness" Value="1" />
+            <Setter Property="CornerRadius" Value="12" />
+            <Setter Property="Padding" Value="12,9" />
+        </Style>
+
+        <!-- The key as a keycap, then the word that says it can be changed -->
+        <Style Selector="Border.KeyCap">
+            <Setter Property="CornerRadius" Value="7" />
+            <Setter Property="Padding" Value="9,3" />
+            <Setter Property="MinWidth" Value="34" />
+            <Setter Property="BorderThickness" Value="1,1,1,2" />
+            <Setter Property="BorderBrush" Value="#50FFFFFF" />
+            <Setter Property="Background">
+                <LinearGradientBrush StartPoint="0%,0%" EndPoint="0%,100%">
+                    <GradientStop Color="#34FFFFFF" Offset="0.0" />
+                    <GradientStop Color="#14FFFFFF" Offset="1.0" />
+                </LinearGradientBrush>
+            </Setter>
+        </Style>
+
+        <Style Selector="Button.KeyChip">
+            <Setter Property="Focusable" Value="False" />
+            <Setter Property="Padding" Value="5,4,11,4" />
+            <Setter Property="CornerRadius" Value="11" />
+            <Setter Property="BorderThickness" Value="1" />
+        </Style>
+
+        <Style Selector="Button.KeyChip /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="CornerRadius" Value="11" />
+            <Setter Property="Background" Value="#1035D22B" />
+            <Setter Property="BorderBrush" Value="#3535D22B" />
+        </Style>
+
+        <Style Selector="Button.KeyChip:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="Background" Value="#2435D22B" />
+            <Setter Property="BorderBrush" Value="#7035D22B" />
+        </Style>
+
+        <Style Selector="Button.KeyChip:disabled /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="Background" Value="#08FFFFFF" />
+            <Setter Property="BorderBrush" Value="#14FFFFFF" />
+        </Style>
+
+        <Style Selector="Button.KeyChip:disabled">
+            <Setter Property="Opacity" Value="0.55" />
+        </Style>
+
+        <!-- ================================================================= -->
+        <!-- SETTINGS: BACKGROUND PICKER                                        -->
+        <!-- ================================================================= -->
+        <Style Selector="Button.BgTile">
+            <Setter Property="Focusable" Value="False" />
+            <Setter Property="Padding" Value="0" />
+            <Setter Property="BorderThickness" Value="0" />
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="HorizontalAlignment" Value="Stretch" />
+            <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+        </Style>
+
+        <Style Selector="Button.BgTile /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="Background" Value="Transparent" />
+        </Style>
+
+        <Style Selector="Button.BgTile:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="Background" Value="Transparent" />
+        </Style>
+
+        <Style Selector="Button.BgTile:pressed /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="Background" Value="Transparent" />
+        </Style>
+
+        <!-- The ring, with a 3 px gap to the picture. The picture has its own
+             rounded clip one step tighter, so the two curves stay parallel. -->
+        <Style Selector="Button.BgTile Border.BgTileFrame">
+            <Setter Property="CornerRadius" Value="14" />
+            <Setter Property="Padding" Value="3" />
+            <Setter Property="BorderThickness" Value="1.5" />
+            <Setter Property="BorderBrush" Value="#1CFFFFFF" />
+            <Setter Property="Background" Value="#0A0E0C" />
+            <Setter Property="Transitions">
+                <Transitions>
+                    <BrushTransition Property="BorderBrush" Duration="0:0:0.18" />
+                    <BoxShadowsTransition Property="BoxShadow" Duration="0:0:0.18" />
+                </Transitions>
+            </Setter>
+        </Style>
+
+        <Style Selector="Button.BgTile Border.BgTileImage">
+            <Setter Property="Height" Value="82" />
+            <Setter Property="CornerRadius" Value="10" />
+            <Setter Property="ClipToBounds" Value="True" />
+            <Setter Property="Background" Value="#0C1014" />
+        </Style>
+
+        <Style Selector="Button.BgTile:pointerover Border.BgTileFrame">
+            <Setter Property="BorderBrush" Value="#60FFFFFF" />
+        </Style>
+
+        <Style Selector="Button.BgTile.Selected Border.BgTileFrame">
+            <Setter Property="BorderBrush" Value="#35D22B" />
+            <Setter Property="BoxShadow" Value="0 0 16 0 #5035D22B" />
+        </Style>
+
+        <Style Selector="Button.BgTileRemove">
+            <Setter Property="Focusable" Value="False" />
+            <Setter Property="Width" Value="22" />
+            <Setter Property="Height" Value="22" />
+            <Setter Property="Padding" Value="0" />
+            <Setter Property="CornerRadius" Value="11" />
+            <Setter Property="BorderThickness" Value="1" />
+            <Setter Property="HorizontalContentAlignment" Value="Center" />
+            <Setter Property="VerticalContentAlignment" Value="Center" />
+        </Style>
+
+        <Style Selector="Button.BgTileRemove /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="Background" Value="#D00B1210" />
+            <Setter Property="BorderBrush" Value="#40FFFFFF" />
+        </Style>
+
+        <Style Selector="Button.BgTileRemove:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="Background" Value="#E0B42318" />
+            <Setter Property="BorderBrush" Value="#80FF6961" />
+        </Style>
+
+        <Style Selector="Button.BgTile TextBlock.BgTileLabel">
+            <Setter Property="Foreground" Value="#94A3B8" />
+        </Style>
+
+        <Style Selector="Button.BgTile:pointerover TextBlock.BgTileLabel">
+            <Setter Property="Foreground" Value="#E2E8F0" />
+        </Style>
+
+        <Style Selector="Button.BgTile.Selected TextBlock.BgTileLabel">
+            <Setter Property="Foreground" Value="#FFFFFF" />
         </Style>
 
     </Application.Styles>

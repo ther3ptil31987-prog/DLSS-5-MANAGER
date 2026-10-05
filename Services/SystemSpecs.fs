@@ -1,6 +1,7 @@
 namespace DLSS_5_MANAGER.Services
 
 open System
+open System.Text.RegularExpressions
 open Microsoft.Win32
 
 /// Reads the machine's graphics card, driver, processor and Windows build.
@@ -95,6 +96,38 @@ module SystemSpecs =
                 | None -> ("", "")
         with _ ->
             ("", "")
+
+    // =====================================================================
+    // THE CARD, ON ITS OWN
+    // =====================================================================
+    /// `detect` builds the whole sheet for the community composer, and only
+    /// when the user presses Detect. These two answer the much smaller question
+    /// "which card is in this machine", for the places that install by it: the
+    /// OptiScaler route and the About card. The reading is cached, so asking
+    /// repeatedly - once per install, once per settings page - costs one
+    /// registry read for the life of the process.
+    let private cachedGpu = lazy (fst (readGpu ()))
+
+    /// The card games run on, or "" when it cannot be read. A machine with both
+    /// an integrated chip and a real card answers with the real one, because
+    /// `readGpu` asks for the vendors in order - NVIDIA first.
+    let gpuName () = cachedGpu.Value
+
+    /// The RTX 40 **and 50** series: 4050-4090 and 5050-5090, laptop parts
+    /// included, plus the professional "RTX 4000 Ada" and "RTX 5000" alongside
+    /// them. They all take the same OptiScaler build; every older card takes
+    /// the other one.
+    ///
+    /// "RTX A4000" and "RTX A5000" are Ampere and deliberately do not match:
+    /// their letter sits where this pattern wants the first digit.
+    let private rtx40Pattern =
+        Regex(@"RTX\s*(40|50)\d{2}", RegexOptions.IgnoreCase ||| RegexOptions.CultureInvariant)
+
+    let isRtx40Name (name: string) =
+        not (String.IsNullOrWhiteSpace(name)) && rtx40Pattern.IsMatch(name)
+
+    /// Whether this machine takes the RTX 40/50 build.
+    let isRtx40 () = isRtx40Name (gpuName ())
 
     let private readCpu () =
         try

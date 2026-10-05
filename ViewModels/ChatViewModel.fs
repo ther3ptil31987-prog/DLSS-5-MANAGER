@@ -1,4 +1,4 @@
-namespace DLSS_5_MANAGER.ViewModels
+﻿namespace DLSS_5_MANAGER.ViewModels
 
 open System
 open System.Collections.Generic
@@ -6,6 +6,7 @@ open System.Collections.ObjectModel
 open System.IO
 open System.Runtime.InteropServices
 open System.Text.Json
+open System.Text.RegularExpressions
 open System.Threading.Tasks
 open Avalonia.Media.Imaging
 open Avalonia.Threading
@@ -148,6 +149,35 @@ type ChatReactionViewModel(messageId: int64, emoji: string, count: int, mine: bo
     member _.IsMine = mine
 
 
+/// Calling the developer by name in the chat.
+///
+/// People write "@nodixtech" constantly, and until now it read as ordinary
+/// grey text among everything else - so the one message actually addressed to
+/// him looked exactly like the hundred that were not.
+module private MentionText =
+
+    /// Loose on purpose: "@nodixtech", "@NodixTech" and "@nodix tech" are all
+    /// the same person being called, and the point is that he notices.
+    let private pattern =
+        Regex(@"@nodix\s*tech", RegexOptions.IgnoreCase ||| RegexOptions.CultureInvariant)
+
+    /// Splits a message around the first mention: what comes before it, the
+    /// mention exactly as the sender typed it, and the rest.
+    ///
+    /// A message with no mention hands the whole body back as the first part,
+    /// so one template draws both cases with no visibility switch and no
+    /// second copy of the bubble.
+    let split (body: string) =
+        if String.IsNullOrEmpty(body) then
+            ("", "", "")
+        else
+            let m = pattern.Match(body)
+
+            if m.Success then
+                (body.Substring(0, m.Index), m.Value, body.Substring(m.Index + m.Length))
+            else
+                (body, "", "")
+
 /// One message in the conversation.
 type PulseMessageViewModel
     (initial: CommunityApi.ChatMessageDto, mine: bool, viewerIsDev: bool, myReactions: HashSet<string>) =
@@ -190,7 +220,32 @@ type PulseMessageViewModel
     /// name - so it cannot be faked by a lookalike.
     member _.IsVerified = dto.Dev
 
+    /// What this person is, beside their name. Set by the server from their
+    /// profile, exactly like the developer flag above - an ordinary player
+    /// carries no badge at all.
+    member _.HasRole = CommunityShared.hasRole dto.Role
+    member _.RoleText = CommunityShared.roleText dto.Role
+    member _.RoleAccent = CommunityShared.roleAccent dto.Role
+    member _.RoleTint = CommunityShared.roleTint dto.Role
+    member _.RoleEdge = CommunityShared.roleEdge dto.Role
+
     member _.Body = if isNull dto.Body then "" else dto.Body
+
+    /// The message split around a mention of the developer, so the bubble can
+    /// paint his name blue without a second template. With no mention the
+    /// whole body lands in `BodyBefore` and the other two are empty, which
+    /// draws exactly as it always did.
+    member this.BodyBefore =
+        let (before, _, _) = MentionText.split this.Body
+        before
+
+    member this.MentionText =
+        let (_, mention, _) = MentionText.split this.Body
+        mention
+
+    member this.BodyAfter =
+        let (_, _, after) = MentionText.split this.Body
+        after
     member _.HasBody = not (String.IsNullOrWhiteSpace(dto.Body))
     member _.Ago = CommunityShared.ago dto.Created
     member _.IsMine = mine
@@ -298,6 +353,28 @@ type PulseMessageViewModel
         | None when not (String.IsNullOrWhiteSpace(dto.Image)) -> ChatImages.tryReadCached dto.Image
         | None -> None
 
+    /// Fixing your own words.
+    ///
+    /// There is effectively no clock on it any more: a minute meant the link
+    /// was gone by the time someone came back with the answer they had
+    /// promised, while the server refused underneath a button that was still
+    /// drawn - which is what people meant by "editing does not work". The
+    /// server still bounds it (thirty days) and this draws the same bound, so
+    /// the two can never disagree.
+    member _.CanEditNow =
+        mine
+        && not isPending
+        && DateTimeOffset.UtcNow.ToUnixTimeSeconds() - dto.Created <= CommunityApi.ChatEditSeconds
+
+    /// The corrected text, in place. Everything drawn from the body has to be
+    /// told - the mention split included, or a corrected message would keep
+    /// painting the old name blue.
+    member this.ApplyEdit(text: string) =
+        dto <- { dto with Body = (if isNull text then "" else text) }
+
+        for name in [ "Body"; "HasBody"; "BodyBefore"; "MentionText"; "BodyAfter"; "Dto" ] do
+            this.RaisePropertyChanged(name)
+
     // ---- sending -------------------------------------------------------------
     member _.MarkPending(picture: byte[] option) =
         isPending <- true
@@ -340,6 +417,11 @@ type PulseViewModel() =
     let mutable pending: ChatImages.Encoded option = None
     let mutable pendingPreview: Bitmap option = None
     let mutable replyingTo: PulseMessageViewModel option = None
+
+    /// The message being corrected, if any. Editing borrows the composer
+    /// rather than opening a second box inside the bubble: one place to type,
+    /// one Send button, and nothing new to lay out.
+    let mutable editing: PulseMessageViewModel option = None
 
     let mutable isAttaching = false
     let mutable isLoadingOlder = false
@@ -491,6 +573,11 @@ type PulseViewModel() =
                 match byId.TryGetValue(u.Id) with
                 | true, vm ->
                     vm.SetReactions(u.Rx)
+
+                    // An edit rides this same channel. A server too old to
+                    // send the field leaves it null, which reads as "unchanged".
+                    if not (isNull u.Body) && u.Body <> vm.Body then vm.ApplyEdit(u.Body)
+
                     changed <- changed + 1
                 | _ -> ()
 
@@ -864,6 +951,59 @@ type PulseViewModel() =
         | Some m -> PulseLimits.snippet m.Body m.HasImage
         | None -> ""
 
+    member _.IsEditing = editing.IsSome
+
+    /// Puts the message into the composer. Replying and editing are mutually
+    /// exclusive - both use the same box, and carrying a reply into an edit
+    /// would silently attach it to the corrected message.
+    member this.BeginEdit(message: PulseMessageViewModel) =
+        if message.CanEditNow then
+            editing <- Some message
+            replyingTo <- None
+            draft <- message.Body
+            this.RaiseComposer()
+            this.RaiseReply()
+            this.RaisePropertyChanged("IsEditing")
+
+    member private this.CommitEdit(text: string) =
+        match editing with
+        | None -> ()
+        | Some target ->
+            if text.Length = 0 && not target.HasImage then
+                this.SetStatus("An edit cannot empty the message.")
+            elif this.IsOverLimit then
+                this.SetStatus(
+                    sprintf "Keep it under %d characters and %d words." PulseLimits.MaxChars PulseLimits.MaxWords
+                )
+            elif text = target.Body then
+                this.CancelEdit()
+            else
+                // The composer is released first: the correction is already
+                // typed, and holding the box hostage to the round trip would
+                // make a slow connection feel like a hang.
+                editing <- None
+                draft <- ""
+                this.RaiseComposer()
+                this.RaisePropertyChanged("IsEditing")
+
+                let id = target.Id
+
+                Task.Run(fun () ->
+                    let result = CommunityApi.editChat id text
+
+                    ui (fun () ->
+                        match result with
+                        | Ok saved -> target.ApplyEdit(saved)
+                        | Error e -> this.SetStatus(e)))
+                |> ignore
+
+    member this.CancelEdit() =
+        if editing.IsSome then
+            editing <- None
+            draft <- ""
+            this.RaiseComposer()
+            this.RaisePropertyChanged("IsEditing")
+
     member private this.SetStatus(text: string) =
         status <- text
         this.RaisePropertyChanged("Status")
@@ -958,6 +1098,13 @@ type PulseViewModel() =
         let text = draft.Trim()
         let norm = PulseLimits.normalise text
 
+        // Correcting, not sending. The cooldown and the duplicate check below
+        // are about new messages arriving; an edit replaces one that is already
+        // on screen, so neither applies to it.
+        if editing.IsSome then
+            this.CommitEdit(text)
+        else
+
         if isAttaching || (text.Length = 0 && pending.IsNone) then
             ()
         elif this.IsOverLimit then
@@ -984,6 +1131,11 @@ type PulseViewModel() =
                   Author = (if myName = "" then "You" else myName)
                   Tag = CommunityApi.pulseTag.Value
                   Dev = viewerIsDev
+                  // This is the bubble shown before the server answers, and the
+                  // app never learns its own role - only whether it is the
+                  // developer. The real one arrives with the confirmed message
+                  // a moment later, and `Confirm` swaps this row for it.
+                  Role = ""
                   Body = text
                   Image = ""
                   W = (match image with Some e -> e.Width | None -> 0)
@@ -1134,8 +1286,15 @@ type PulseViewModel() =
     member _.ViewerBytes = viewerBytes
     member _.ViewerFileName = sprintf "dlss5-chat-%d" viewerId
 
+    /// The message the open picture belongs to - what "to gallery" sends.
+    member _.ViewerId = viewerId
+
+    /// Whether the person looking is the developer. It only decides whether the
+    /// "to gallery" button is drawn; the server checks again before copying.
+    member _.ViewerIsDev = viewerIsDev
+
     member private this.RaiseViewer() =
-        for name in [ "IsViewerOpen"; "ViewerImage"; "ViewerFileName" ] do
+        for name in [ "IsViewerOpen"; "ViewerImage"; "ViewerFileName"; "ViewerIsDev" ] do
             this.RaisePropertyChanged(name)
 
     /// Opens the picture at full size. Decoded off the UI thread; a picture

@@ -1,4 +1,4 @@
-namespace DLSS_5_MANAGER.ViewModels
+﻿namespace DLSS_5_MANAGER.ViewModels
 
 open System
 open System.Collections.ObjectModel
@@ -192,12 +192,54 @@ type AtmosphereOption(key: string) =
     inherit ViewModelBase()
 
     let mutable display = key
+    let mutable isSelected = false
+    let mutable thumbnail: Imaging.Bitmap = null
+    let mutable thumbnailTried = false
 
     member _.Key = key
 
     member this.Display
         with get () = display
         and set value = this.SetProperty(&display, value) |> ignore
+
+    /// The tile that is the window's background right now.
+    member this.IsSelected
+        with get () = isSelected
+        and set value = this.SetProperty(&isSelected, value) |> ignore
+
+    /// The last tile of the background picker: the user's own picture rather
+    /// than an atmosphere. Its key is never saved as an atmosphere.
+    member _.IsCustom = key = AtmosphereOption.CustomKey
+
+    /// Decoded the first time a tile asks for it, which is the first time the
+    /// Visual Atmosphere section is unfolded - never at startup. The custom
+    /// tile has no file of its own; the view model hands it one.
+    member _.Thumbnail: Imaging.Bitmap =
+        if not thumbnailTried && key <> AtmosphereOption.CustomKey then
+            thumbnailTried <- true
+
+            thumbnail <-
+                try
+                    let path = BackgroundStore.themeThumbnail key
+                    if IO.File.Exists(path) then new Imaging.Bitmap(path) else null
+                with _ ->
+                    null
+
+        thumbnail
+
+    member this.HasThumbnail = not (isNull this.Thumbnail)
+
+    /// The small x on the custom tile, once it holds a picture.
+    member this.CanRemove = key = AtmosphereOption.CustomKey && this.HasThumbnail
+
+    member this.SetThumbnail(bitmap: Imaging.Bitmap) =
+        thumbnailTried <- true
+        thumbnail <- bitmap
+        this.RaisePropertyChanged("Thumbnail")
+        this.RaisePropertyChanged("HasThumbnail")
+        this.RaisePropertyChanged("CanRemove")
+
+    static member CustomKey = "Custom"
 
     override _.ToString() = display
 
@@ -222,6 +264,11 @@ type MainViewModel() as this =
     let mutable isSearchOpen = false
     let mutable isScanning = false
     let mutable scanStatusText = "Ready"
+
+    /// The six-second grace period before an automatic scan starts.
+    let autoScanTimer = DispatcherTimer(Interval = TimeSpan.FromSeconds(1.0))
+    let mutable autoScanSecondsLeft = 6
+    let mutable isAutoScanPending = false
     let mutable isDraggingCard = false
     let mutable draggedCard: GameCardViewModel option = None
     let mutable isSidebarLayout = false
@@ -231,20 +278,66 @@ type MainViewModel() as this =
     /// The community section. Built with the window so the tab can switch to it
     /// instantly; it does not touch the network until the tab is opened.
     let community = CommunityViewModel()
+    let screen = ScreenViewModel()
 
     /// PULSE, the chat inside the community section. Owned here rather than by
     /// the community view-model because it has to know about window focus -
     /// a minimised app must not poll - and about which section is on screen.
     let pulse = PulseViewModel()
 
-    /// Which half of the community section is showing: the games, or PULSE.
-    let mutable isPulseOpen = false
+    /// The private chat, the fourth tab. One thread per person with the
+    /// developer; a player sees only their own, which is the whole point.
+    let dm = DmViewModel()
+
+    /// The gallery, the third tab of the community section. Like the chat it
+    /// is built with the window and touches the network only once opened.
+    let gallery = GalleryViewModel()
+
+    /// The Downloads sheet (`CloudAssets`). It opens by itself once, on the
+    /// first launch that finds something missing; after it has been put away
+    /// the download button at the top is the way back to it.
+    let assets = SetupViewModel()
+    let mutable isAssetsOpen = assets.HasMissing && not (CloudAssets.wasPostponed ())
+    let mutable downloadsHint = false
+
+    /// Which of the three tabs of the community section is showing:
+    /// "games", "chat" or "gallery".
+    ///
+    /// This was a bool while there were only two. The members below keep their
+    /// old names and meanings so every binding in the window still reads the
+    /// same, and no combination of tabs can be half-set.
+    let mutable communityTab = "games"
 
     // ---- Manage sheet state ---------------------------------------------
     let mutable isManageOpen = false
     let mutable manageCard: GameCardViewModel option = None
+
+    // ---- What the community found, for the game whose sheet is open --------
+    //
+    // Reading is public: the counts come from the same endpoint the grid uses
+    // and need no name. Posting and replying are where the community asks who
+    // you are, which is what the button into it leads to.
+    let mutable glanceOpen = false
+    let mutable glanceBusy = false
+    let mutable glanceFor = ""                              // the title it was fetched for
+    let mutable glanceGame: CommunityApi.GameDto option = None
+    let mutable glanceMessage = ""
+
+    /// What the community said about the last thirty games, by title.
+    ///
+    /// In memory only - nothing is written to disk for it: the answers are
+    /// small, they go stale, and a person who opens six games in a row should
+    /// not wait for six round trips. The order of arrival is kept beside it so
+    /// the oldest can go when the thirty-first arrives. `None` is remembered
+    /// too: "the community does not have this game" is an answer, and asking
+    /// again every time the panel opens would be the same waste.
+    let glanceCache = System.Collections.Generic.Dictionary<string, CommunityApi.GameDto option>(StringComparer.OrdinalIgnoreCase)
+    let glanceOrder = System.Collections.Generic.Queue<string>()
     let mutable manageAnalysis: AnalysisStore.GameAnalysis option = None
     let mutable manageTitle = ""
+    /// The anti-cheat the open game carries (AntiCheat.detect): None when
+    /// none was found, Some "" when something is only named like one.
+    let mutable manageAntiCheat: string option = None
     let mutable manageExePath = ""
     let mutable manageFolder = ""
     let mutable manageReShadeText = "Checking..."
@@ -283,6 +376,10 @@ type MainViewModel() as this =
     let mutable useMfgUnlock = false
     let mutable useMultipass = false
 
+    /// Deep-fried chicken in RenoDX's place, on the same routes. Turning it on
+    /// turns Multipass off - that option only picks a RenoDX build.
+    let mutable useDeepFried = false
+
     /// The route and build recorded in the manifest for the open game, "" when
     /// this app did not install it. Drives the Install / Switch / Remove button.
     let mutable installedRoute = ""
@@ -291,6 +388,12 @@ type MainViewModel() as this =
     let mutable installedNeural = false
     let mutable installedMfgUnlock = false
     let mutable installedMultipass = false
+    let mutable installedDeepFried = false
+
+    /// The deployment log is folded away by default. It is the only thing in
+    /// the sheet long enough to stretch it past the screen, and it is reference
+    /// material - the headline above it already says how the run went.
+    let mutable isInstallResultExpanded = false
 
     /// True once the user has picked a route in the open sheet. Detection then
     /// stops overriding it - see SetInstallMode.
@@ -310,6 +413,10 @@ type MainViewModel() as this =
     let mutable isTargetDetailsOpen = false
 
     // ---- What the game itself turned out to be ---------------------------
+    /// Every renderer the title can use, newest DirectX first. A game that
+    /// offers two - DirectX 12 *and* Vulkan - carries both here.
+    let mutable detectedApis: string[] = [||]
+    /// The first of those: the one the routing decides on.
     let mutable detectedApi = ""
     let mutable detectedArch = ""
     let mutable detectedDlss = false
@@ -347,8 +454,22 @@ type MainViewModel() as this =
     let mutable hasUpdateAvailable = false
     let mutable latestVersionFound = ""
 
-    let mutable selectedColorAtmosphere = "Neon Emerald"
+    let mutable selectedColorAtmosphere = "Emerald Horizon"
+
+    /// No longer drawn - the pictures replaced the shapes - but still saved,
+    /// so a settings file keeps what it held.
     let mutable selectedGeometricMotif = "Orbital Spheres"
+
+    /// The picture behind the window, the user's own picture when there is one,
+    /// and how bright it is allowed to be. See `BackgroundStore`.
+    let mutable background = BackgroundStore.load ()
+    let mutable backgroundImage: Imaging.Bitmap = null
+
+    /// The mean luminance of the picture on screen, which the dim layer
+    /// compensates for - see `BackgroundStore.exposure`.
+    let mutable backgroundLuminance = BackgroundStore.ReferenceLuminance
+    /// The mean luminance of the picture's brightest quarter - what the glare is judged on.
+    let mutable backgroundBright = BackgroundStore.ReferenceLuminance
 
     /// AMD RDNA 4 route. Off until the user turns it on, and then every game
     /// installs through that one payload instead of the usual routes.
@@ -377,12 +498,12 @@ type MainViewModel() as this =
     let atmosphereOptions =
         ObservableCollection<AtmosphereOption>(atmosphereKeys |> Array.map AtmosphereOption)
 
-    let motifKeys =
-        [| "Orbital Spheres"; "Prism Auroras"; "Floating Crystals"
-           "Stardust Particles"; "Cyber Flux"; "Minimal Clean" |]
+    /// The background picker in Settings: every atmosphere, then the user's
+    /// own picture as the last tile.
+    let customTile = AtmosphereOption(AtmosphereOption.CustomKey)
 
-    let motifOptions =
-        ObservableCollection<AtmosphereOption>(motifKeys |> Array.map AtmosphereOption)
+    let backgroundTiles =
+        ObservableCollection<AtmosphereOption>(Seq.append atmosphereOptions [ customTile ])
 
     /// Rewrites the labels in place for the language now in use.
     let relabelAtmospheres (strings: Localization.Strings) =
@@ -391,14 +512,115 @@ type MainViewModel() as this =
         atmosphereOptions
         |> Seq.iteri (fun i option -> if i < names.Length then option.Display <- names.[i])
 
-        let motifNames = strings.MotifNames
+        customTile.Display <- strings.BackgroundCustom
 
-        motifOptions
-        |> Seq.iteri (fun i option -> if i < motifNames.Length then option.Display <- motifNames.[i])
+    /// Only one tile is lit: the atmosphere on screen, unless the user's own
+    /// picture has taken its place.
+    let markSelectedTile () =
+        for option in atmosphereOptions do
+            option.IsSelected <- not background.UseCustom && option.Key = selectedColorAtmosphere
+
+        customTile.IsSelected <- background.UseCustom
+
+    /// A picture from disk, or null when it cannot be read. Anything wider
+    /// than `maxWidth` is decoded straight down to it, so a 6000 px photo does
+    /// not sit in memory at full size behind the window.
+    let decodeImage (path: string) (maxWidth: int) : Imaging.Bitmap =
+        try
+            if String.IsNullOrWhiteSpace(path) || not (IO.File.Exists(path)) then
+                null
+            else
+                let full =
+                    use stream = IO.File.OpenRead(path)
+                    new Imaging.Bitmap(stream)
+
+                if full.PixelSize.Width <= maxWidth then
+                    full
+                else
+                    full.Dispose()
+                    use stream = IO.File.OpenRead(path)
+                    Imaging.Bitmap.DecodeToWidth(stream, maxWidth)
+        with _ ->
+            null
+
+    /// The picture for whatever is chosen now. The user's own wins while it
+    /// can be read; one that cannot falls back to the atmosphere's.
+    let loadBackground () =
+        let custom =
+            if background.UseCustom then decodeImage background.CustomFile 2560 else null
+
+        if isNull custom then
+            backgroundImage <- decodeImage (BackgroundStore.themeImage selectedColorAtmosphere) 2560
+
+            // The small copy measures the same and reads in a few milliseconds.
+            let mean, bright = BackgroundStore.measureLights (BackgroundStore.themeThumbnail selectedColorAtmosphere)
+            backgroundLuminance <- mean
+            backgroundBright <- bright
+        else
+            backgroundImage <- custom
+
+            // Measured once and kept; a settings file from before the
+            // measurement existed gets it on the first launch that needs it.
+            if background.CustomLuminance <= 0.0 || background.CustomBright <= 0.0 then
+                let mean, bright = BackgroundStore.measureLights background.CustomFile
+                background <- { background with CustomLuminance = mean; CustomBright = bright }
+
+                BackgroundStore.save background
+
+            backgroundLuminance <- background.CustomLuminance
+            backgroundBright <- background.CustomBright
+
+    /// The glare last applied, so an unchanged picture does not rebuild the
+    /// brushes on every brightness step that leaves it where it was.
+    let mutable appliedGlare = -1.0
+
+    /// Glare - see `BackgroundStore.glare`. The brushes are declared in
+    /// App.axaml and used through DynamicResource; this replaces them with ones
+    /// matched to the picture on screen. Over a dark picture they come out as
+    /// the surfaces exactly as the XAML always had them.
+    let applyGlare () =
+        match Application.Current with
+        | null -> ()
+        | app ->
+            let g = BackgroundStore.glare background.Brightness backgroundLuminance backgroundBright
+
+            if abs (g - appliedGlare) > 0.002 then
+                appliedGlare <- g
+
+                // A surface's own glass laid over the app's dark glass
+                // (#0B1014), that tint growing with the glare.
+                let over (baseColor: string) (tint: float) =
+                    let c = Color.Parse(baseColor)
+                    let aw = float c.A / 255.0
+                    let a = aw + (1.0 - aw) * tint
+
+                    if a <= 0.0 then
+                        Colors.Transparent
+                    else
+                        let mix (w: byte) (d: float) =
+                            byte (Math.Round((aw * float w + (1.0 - aw) * tint * d) / a))
+
+                        Color.FromArgb(byte (Math.Round(a * 255.0)), mix c.R 11.0, mix c.G 16.0, mix c.B 20.0)
+
+                let res = app.Resources
+                res.["GlareVeilBrush"] <- SolidColorBrush(Color.FromArgb(byte (Math.Round(0.26 * g * 255.0)), 0uy, 0uy, 0uy))
+                res.["GlareCardBrush"] <- SolidColorBrush(over "#08FFFFFF" (0.62 * g))
+                res.["GlareHeaderBrush"] <- SolidColorBrush(over "#10FFFFFF" (0.62 * g))
+                res.["GlareScreenCardBrush"] <- SolidColorBrush(over "#10000000" (0.62 * g))
+                res.["GlareBackingBrush"] <- SolidColorBrush(over "#00000000" (0.55 * g))
+
+                let capsule =
+                    LinearGradientBrush(
+                        StartPoint = RelativePoint(0.0, 0.0, RelativeUnit.Relative),
+                        EndPoint = RelativePoint(1.0, 1.0, RelativeUnit.Relative)
+                    )
+
+                capsule.GradientStops.Add(GradientStop(over "#30FFFFFF" (0.55 * g), 0.0))
+                capsule.GradientStops.Add(GradientStop(over "#12FFFFFF" (0.55 * g), 0.5))
+                capsule.GradientStops.Add(GradientStop(over "#20FFFFFF" (0.55 * g), 1.0))
+                res.["GlareCapsuleBrush"] <- capsule
 
     let mutable bgBaseBrush: IBrush = SolidColorBrush(Color.Parse("#080D0A"))
-    let mutable bgOrb1Brush: IBrush = null
-    let mutable bgOrb2Brush: IBrush = null
     let mutable bgVignetteBrush: IBrush = null
     let mutable motifAccentBrush: IBrush = SolidColorBrush(Color.Parse("#35D22B"))
 
@@ -408,21 +630,46 @@ type MainViewModel() as this =
     /// Performance mode: no moving background, no card hover animation.
     let mutable isPerformanceMode = false
 
-    /// The in-game overlay, and the look it wears. Deployed with every install
-    /// on the routes that can host it - see `ModInstaller.overlaySupported`.
+    /// The in-game overlay, and the look it wears. Deployed with an install on
+    /// the routes that can host it - see `ModInstaller.overlaySupported`.
+    /// On or off is chosen per game, in its Manage sheet: `isOverlayEnabled`
+    /// is the open sheet's choice, `overlayDefault` the last choice made in
+    /// any sheet - what a game this app has not installed yet opens on, and
+    /// what `OverlayDisabled` saves (inverted).
     let mutable isOverlayEnabled = true
+    let mutable overlayDefault = true
     let mutable overlayTheme = ModInstaller.overlayThemes.[0]
     let mutable overlayHotkey = ModInstaller.overlayHotkeys.[0]
 
-    let createRadialBrush (centerHex: string) =
-        let brush = RadialGradientBrush()
-        brush.Center <- RelativePoint(0.5, 0.5, RelativeUnit.Relative)
-        brush.GradientOrigin <- RelativePoint(0.5, 0.5, RelativeUnit.Relative)
-        brush.RadiusX <- RelativeScalar(0.5, RelativeUnit.Relative)
-        brush.RadiusY <- RelativeScalar(0.5, RelativeUnit.Relative)
-        brush.GradientStops.Add(GradientStop(Color.Parse(centerHex), 0.0))
-        brush.GradientStops.Add(GradientStop(Color.FromArgb(0uy, 0uy, 0uy, 0uy), 1.0))
-        brush
+    /// The key that opens ReShade in game, and the line under the key chips.
+    let mutable reshadeKey = ModInstaller.savedReShadeKey ()
+    let mutable keysStatus = ""
+
+    /// Manage sheet -> DLL NAME: folded away until asked for. The proxy names
+    /// are what the open game's install uses right now ("" = none of that kind).
+    let mutable dllNamesOpen = false
+    let mutable optiProxyName = ""
+    let mutable reshadeProxyName = ""
+    let mutable optiProxyPick = ModInstaller.optiScalerProxyNames.[0]
+    let mutable reshadeProxyPick = ModInstaller.reShadeProxyNames.[0]
+    let mutable optiCustomName = ""
+    let mutable reshadeCustomName = ""
+    let mutable dllNameStatus = ""
+    let mutable dllNameIsError = false
+    /// The names come from ModInstaller's cache, or from a read of the disk in
+    /// the background - never on the UI thread. Until the first answer for the
+    /// open game arrives the card stays down.
+    let mutable dllNamesKnown = false
+    let mutable dllFolderNames: Set<string> = Set.empty
+    let mutable optiChoices: string[] = ModInstaller.optiScalerProxyNames
+    let mutable reshadeChoices: string[] = ModInstaller.reShadeProxyNames
+    let mutable dllScanGeneration = 0
+    let mutable dllBusy = false
+
+    /// The key that opens OptiScaler's own menu. Kept like ReShade's - one
+    /// choice for every install, not one per game.
+    let mutable optiMenuKey = ModInstaller.savedOptiMenuKey ()
+    let mutable optiKeyStatus = ""
 
     let createVignetteBrush (edgeHex: string) =
         let brush = RadialGradientBrush()
@@ -439,58 +686,40 @@ type MainViewModel() as this =
         match colorTheme with
         | "Obsidian Onyx" ->
             bgBaseBrush <- SolidColorBrush(Color.Parse("#0C0E14"))
-            bgOrb1Brush <- createRadialBrush("#283552")
-            bgOrb2Brush <- createRadialBrush("#1E2038")
             bgVignetteBrush <- createVignetteBrush("#5004030A")
             motifAccentBrush <- SolidColorBrush(Color.Parse("#38BDF8"))
         | "Supernova Flare" ->
             bgBaseBrush <- SolidColorBrush(Color.Parse("#140A0C"))
-            bgOrb1Brush <- createRadialBrush("#5C1A22")
-            bgOrb2Brush <- createRadialBrush("#3D101C")
             bgVignetteBrush <- createVignetteBrush("#550E0305")
             motifAccentBrush <- SolidColorBrush(Color.Parse("#F43F5E"))
         | "Cyber Nebula" ->
             bgBaseBrush <- SolidColorBrush(Color.Parse("#0D0B16"))
-            bgOrb1Brush <- createRadialBrush("#3D1E5A")
-            bgOrb2Brush <- createRadialBrush("#1C2454")
             bgVignetteBrush <- createVignetteBrush("#5007030F")
             motifAccentBrush <- SolidColorBrush(Color.Parse("#C084FC"))
         | "Emerald Horizon" ->
             bgBaseBrush <- SolidColorBrush(Color.Parse("#081010"))
-            bgOrb1Brush <- createRadialBrush("#14423A")
-            bgOrb2Brush <- createRadialBrush("#0E3140")
             bgVignetteBrush <- createVignetteBrush("#50020808")
             motifAccentBrush <- SolidColorBrush(Color.Parse("#34D399"))
         | "Midnight Titanium" ->
             bgBaseBrush <- SolidColorBrush(Color.Parse("#0A0A0C"))
-            bgOrb1Brush <- createRadialBrush("#2D2E38")
-            bgOrb2Brush <- createRadialBrush("#1C1D24")
             bgVignetteBrush <- createVignetteBrush("#50000000")
             motifAccentBrush <- SolidColorBrush(Color.Parse("#E2E8F0"))
         | "Frost Glacier" ->
             bgBaseBrush <- SolidColorBrush(Color.Parse("#091017"))
-            bgOrb1Brush <- createRadialBrush("#18435C")
-            bgOrb2Brush <- createRadialBrush("#162842")
             bgVignetteBrush <- createVignetteBrush("#50030A12")
             motifAccentBrush <- SolidColorBrush(Color.Parse("#38BDF8"))
         | "Eclipse Crimson" ->
             bgBaseBrush <- SolidColorBrush(Color.Parse("#12070A"))
-            bgOrb1Brush <- createRadialBrush("#4C111F")
-            bgOrb2Brush <- createRadialBrush("#2E0814")
             bgVignetteBrush <- createVignetteBrush("#550F0206")
             motifAccentBrush <- SolidColorBrush(Color.Parse("#E11D48"))
         | "Deep Astral" ->
             bgBaseBrush <- SolidColorBrush(Color.Parse("#070B14"))
-            bgOrb1Brush <- createRadialBrush("#152C4E")
-            bgOrb2Brush <- createRadialBrush("#0F1A30")
             bgVignetteBrush <- createVignetteBrush("#5002060D")
             motifAccentBrush <- SolidColorBrush(Color.Parse("#60A5FA"))
         | _ ->
             // Neon Emerald: signature DLSS 5 MANAGER atmosphere (matches the logo mark)
             selectedColorAtmosphere <- "Neon Emerald"
             bgBaseBrush <- SolidColorBrush(Color.Parse("#080D0A"))
-            bgOrb1Brush <- createRadialBrush("#14401C")
-            bgOrb2Brush <- createRadialBrush("#12291F")
             bgVignetteBrush <- createVignetteBrush("#55020604")
             motifAccentBrush <- SolidColorBrush(Color.Parse("#35D22B"))
 
@@ -533,14 +762,36 @@ type MainViewModel() as this =
         isSidebarLayout <- settings.IsSidebarLayout
         selectedGeometricMotif <- settings.GeometricMotif
         applyAtmosphere settings.ColorAtmosphere
+        loadBackground ()
+        applyGlare ()
+        markSelectedTile ()
+
+        if not (String.IsNullOrWhiteSpace(background.CustomFile)) then
+            customTile.SetThumbnail(decodeImage background.CustomFile 320)
 
         languageCode <- if Localization.isKnownLanguage settings.Language then settings.Language else "en"
         loc <- Localization.Strings(languageCode)
+        Localization.current <- loc
         relabelAtmospheres loc
 
+        // A download finishing changes what the title bar and the Manage
+        // sheet may offer: the button at the top goes once nothing is
+        // missing, and the overlay option unlocks the moment its add-on lands.
+        assets.PropertyChanged.Add(fun args ->
+            match args.PropertyName with
+            | "HasMissing" -> this.RaisePropertyChanged("HasMissingAssets")
+            | "IsAnyBusy" -> this.RaisePropertyChanged("IsAssetsBusy")
+            | "IsOverlayReady" ->
+                this.RaisePropertyChanged("IsOverlayDownloaded")
+                this.RaisePropertyChanged("IsOverlayLocked")
+                this.RaisePropertyChanged("IsOverlayKeyVisible")
+            | _ -> ())
+
         isAmdMode <- settings.AmdMode
+        screen.SetAmdBlocked(isAmdMode)
         isPerformanceMode <- settings.PerformanceMode
-        isOverlayEnabled <- not settings.OverlayDisabled
+        overlayDefault <- not settings.OverlayDisabled
+        isOverlayEnabled <- overlayDefault
 
         overlayTheme <-
             if ModInstaller.overlayThemes |> Array.exists (fun t -> t = settings.OverlayTheme) then
@@ -577,7 +828,7 @@ type MainViewModel() as this =
                       SupportPromptVersion = supportPromptVersion
                       AmdMode = isAmdMode
                       PerformanceMode = isPerformanceMode
-                      OverlayDisabled = not isOverlayEnabled
+                      OverlayDisabled = not overlayDefault
                       OverlayTheme = overlayTheme
                       OverlayHotkey = overlayHotkey })
 
@@ -609,16 +860,20 @@ type MainViewModel() as this =
 
         if firstRunOfThisBuild then
             // 2. Just updated: the cards above are shown straight away so the
-            //    window is never blank, and the real scan replaces them.
+            //    window is never blank, and the real scan replaces them - but
+            //    only after the grace period below, so a huge library can still
+            //    be told not to bother.
             GameScanner.writeCacheVersion UpdateChecker.CurrentVersion
-            this.StartScanAsync()
+            this.ArmAutoScan()
         elif cached.Length > 0 then
             // Top up the deep-scan cache for anything added before this feature
             // existed. Does nothing (and shows nothing) when everything is cached.
             this.AnalyzePendingGames(cached)
         else
-            // First run / empty cache: full library scan
-            this.StartScanAsync()
+            // First run / empty cache: full library scan, after the same grace
+            // period - an empty cache is exactly when someone with a very large
+            // library is most likely to want to stop it.
+            this.ArmAutoScan()
 
         // 3. Look for a newer build every launch. It runs off the UI thread and
         //    stays silent unless there really is one, so startup is unaffected.
@@ -628,14 +883,106 @@ type MainViewModel() as this =
     // THEME / ATMOSPHERE
     // ---------------------------------------------------------------------
     member this.BgBaseBrush = bgBaseBrush
-    member this.BgOrb1Brush = bgOrb1Brush
-    member this.BgOrb2Brush = bgOrb2Brush
     member this.BgVignetteBrush = bgVignetteBrush
     member this.MotifAccentBrush = motifAccentBrush
 
-    /// Drives the background animations: only while the window is the active
-    /// one, and never in performance mode.
-    member this.IsBackgroundMotionOn = isWindowActive && not isPerformanceMode
+    /// The picture behind everything. Null only when the file cannot be read,
+    /// and then the atmosphere's base colour is what shows.
+    member this.BackgroundImage = backgroundImage
+
+    /// 15 to 100, as the Settings slider shows it.
+    member this.BackgroundBrightness
+        with get () = float background.Brightness
+        and set (value: float) =
+            let rounded =
+                max BackgroundStore.MinBrightness (min BackgroundStore.MaxBrightness (int (Math.Round value)))
+
+            if rounded <> background.Brightness then
+                background <- { background with Brightness = rounded }
+                BackgroundStore.save background
+                applyGlare ()
+                this.RaisePropertyChanged("BackgroundBrightness")
+                this.RaisePropertyChanged("BackgroundDimOpacity")
+                this.RaisePropertyChanged("BackgroundBrightnessText")
+
+    /// A black layer over the picture: the lower the brightness, and the
+    /// brighter the picture itself, the more of it there is.
+    member this.BackgroundDimOpacity =
+        1.0 - BackgroundStore.exposure background.Brightness backgroundLuminance
+
+    member this.BackgroundBrightnessText = sprintf "%d%%" background.Brightness
+
+    /// Every tile of the picker, the user's own picture last.
+    member this.BackgroundTiles = backgroundTiles
+
+    member this.HasCustomBackground = customTile.HasThumbnail
+    member this.IsCustomBackgroundActive = background.UseCustom
+
+    member private this.RaiseBackground() =
+        markSelectedTile ()
+        applyGlare ()
+        this.RaisePropertyChanged("BackgroundImage")
+        this.RaisePropertyChanged("BackgroundDimOpacity")
+        this.RaisePropertyChanged("HasCustomBackground")
+        this.RaisePropertyChanged("IsCustomBackgroundActive")
+
+    /// The user's own copy is decoded small for its tile, once, and again
+    /// only when they pick a different picture.
+    member private this.RefreshCustomThumbnail() =
+        customTile.SetThumbnail(
+            if String.IsNullOrWhiteSpace(background.CustomFile) then null
+            else decodeImage background.CustomFile 320
+        )
+
+    /// A tile in Settings: that atmosphere, with its picture. The custom
+    /// tile goes through `UseCustomBackground` / `SetCustomBackground` instead.
+    member this.ChooseAtmosphere(option: AtmosphereOption) =
+        if not (isNull (box option)) && not option.IsCustom then
+            let index = atmosphereKeys |> Array.tryFindIndex ((=) option.Key)
+
+            if background.UseCustom then
+                background <- { background with UseCustom = false }
+                BackgroundStore.save background
+
+                // Same atmosphere as before: the index setter below will see
+                // nothing to change, so the picture is swapped back here.
+                if option.Key = selectedColorAtmosphere then
+                    loadBackground ()
+                    this.RaiseBackground()
+
+            match index with
+            | Some i -> this.SelectedAtmosphereIndex <- i
+            | None -> ()
+
+    /// A picture the user picked. It is copied into our own folder first, so
+    /// it survives the original being moved or deleted.
+    member this.SetCustomBackground(path: string) =
+        match BackgroundStore.importCustom path with
+        | Some copy ->
+            background <- { background with UseCustom = true; CustomFile = copy; CustomLuminance = 0.0; CustomBright = 0.0 }
+            BackgroundStore.save background
+            this.RefreshCustomThumbnail()
+            loadBackground ()
+            this.RaiseBackground()
+        | None -> ()
+
+    /// Back to the user's own picture, already imported earlier.
+    member this.UseCustomBackground() =
+        if this.HasCustomBackground && not background.UseCustom then
+            background <- { background with UseCustom = true }
+            BackgroundStore.save background
+            loadBackground ()
+            this.RaiseBackground()
+
+    member this.RemoveCustomBackground() =
+        BackgroundStore.removeCustom ()
+        background <- { background with UseCustom = false; CustomFile = ""; CustomLuminance = 0.0; CustomBright = 0.0 }
+        BackgroundStore.save background
+        customTile.SetThumbnail(null)
+        loadBackground ()
+        this.RaiseBackground()
+
+    member this.IsBackgroundMotionOn = false
 
     member this.IsWindowActive
         with get () = isWindowActive
@@ -664,7 +1011,7 @@ type MainViewModel() as this =
                       SupportPromptVersion = supportPromptVersion
                       AmdMode = isAmdMode
                       PerformanceMode = isPerformanceMode
-                      OverlayDisabled = not isOverlayEnabled
+                      OverlayDisabled = not overlayDefault
                       OverlayTheme = overlayTheme
                       OverlayHotkey = overlayHotkey }
 
@@ -687,9 +1034,9 @@ type MainViewModel() as this =
 
                 if value <> selectedColorAtmosphere then
                     applyAtmosphere value
+                    loadBackground ()
+                    this.RaiseBackground()
                     this.RaisePropertyChanged("BgBaseBrush")
-                    this.RaisePropertyChanged("BgOrb1Brush")
-                    this.RaisePropertyChanged("BgOrb2Brush")
                     this.RaisePropertyChanged("BgVignetteBrush")
                     this.RaisePropertyChanged("MotifAccentBrush")
                     this.RaisePropertyChanged("SelectedAtmosphereIndex")
@@ -702,7 +1049,7 @@ type MainViewModel() as this =
                           SupportPromptVersion = supportPromptVersion
                           AmdMode = isAmdMode
                           PerformanceMode = isPerformanceMode
-                          OverlayDisabled = not isOverlayEnabled
+                          OverlayDisabled = not overlayDefault
                           OverlayTheme = overlayTheme
                           OverlayHotkey = overlayHotkey }
 
@@ -719,9 +1066,9 @@ type MainViewModel() as this =
 
             if not (String.IsNullOrWhiteSpace(value)) && value <> selectedColorAtmosphere then
                 applyAtmosphere value
+                loadBackground ()
+                this.RaiseBackground()
                 this.RaisePropertyChanged("BgBaseBrush")
-                this.RaisePropertyChanged("BgOrb1Brush")
-                this.RaisePropertyChanged("BgOrb2Brush")
                 this.RaisePropertyChanged("BgVignetteBrush")
                 this.RaisePropertyChanged("MotifAccentBrush")
                 this.RaisePropertyChanged("SelectedColorAtmosphere")
@@ -733,7 +1080,7 @@ type MainViewModel() as this =
                       SupportPromptVersion = supportPromptVersion
                       AmdMode = isAmdMode
                       PerformanceMode = isPerformanceMode
-                      OverlayDisabled = not isOverlayEnabled
+                      OverlayDisabled = not overlayDefault
                       OverlayTheme = overlayTheme
                       OverlayHotkey = overlayHotkey }
 
@@ -759,6 +1106,8 @@ type MainViewModel() as this =
             if code <> languageCode then
                 languageCode <- code
                 loc <- Localization.Strings(code)
+                Localization.current <- loc
+                screen.RaiseLoc()
 
                 this.RaisePropertyChanged("Loc")
                 this.RaisePropertyChanged("SelectedLanguage")
@@ -769,8 +1118,10 @@ type MainViewModel() as this =
                 // again which entry is selected.
                 this.RaisePropertyChanged("SelectedOverlayThemeIndex")
                 community.RelabelFilters()
+                assets.Relabel()
                 this.RaisePropertyChanged("TotalGamesText")
                 this.RaisePropertyChanged("InstallModeHintText")
+                this.RaisePropertyChanged("DeepFriedHint")
                 this.RaiseDlss5State()
 
                 GameScanner.saveSettings
@@ -781,56 +1132,12 @@ type MainViewModel() as this =
                       SupportPromptVersion = supportPromptVersion
                       AmdMode = isAmdMode
                       PerformanceMode = isPerformanceMode
-                      OverlayDisabled = not isOverlayEnabled
+                      OverlayDisabled = not overlayDefault
                       OverlayTheme = overlayTheme
                       OverlayHotkey = overlayHotkey }
 
     /// "TOTAL GAMES: 42" in the current language.
     member this.TotalGamesText = loc.TotalGames(totalGamesCount)
-
-    /// Same arrangement as the colour atmospheres: translated labels on stable
-    /// objects, English keys underneath, so a language change cannot lose the
-    /// selection or the saved value.
-    member this.GeometricMotifs = motifOptions
-
-    member this.SelectedMotifIndex
-        with get () =
-            motifKeys
-            |> Array.tryFindIndex ((=) selectedGeometricMotif)
-            |> Option.defaultValue 0
-        and set (index: int) =
-            // A list swap momentarily reports -1; that is not a user choice.
-            if index >= 0 && index < motifKeys.Length then
-                this.SelectedGeometricMotif <- motifKeys.[index]
-
-    member this.SelectedGeometricMotif
-        with get () = selectedGeometricMotif
-        and set value =
-            if not (String.IsNullOrWhiteSpace(value)) && value <> selectedGeometricMotif then
-                selectedGeometricMotif <- value
-                this.RaisePropertyChanged("SelectedGeometricMotif")
-                this.RaisePropertyChanged("IsOrbitalSpheresVisible")
-                this.RaisePropertyChanged("IsPrismAurorasVisible")
-                this.RaisePropertyChanged("IsFloatingCrystalsVisible")
-                this.RaisePropertyChanged("IsStardustParticlesVisible")
-                this.RaisePropertyChanged("IsCyberFluxVisible")
-                GameScanner.saveSettings
-                    { IsSidebarLayout = isSidebarLayout
-                      ColorAtmosphere = selectedColorAtmosphere
-                      GeometricMotif = value
-                      Language = languageCode
-                      SupportPromptVersion = supportPromptVersion
-                      AmdMode = isAmdMode
-                      PerformanceMode = isPerformanceMode
-                      OverlayDisabled = not isOverlayEnabled
-                      OverlayTheme = overlayTheme
-                      OverlayHotkey = overlayHotkey }
-
-    member this.IsOrbitalSpheresVisible = selectedGeometricMotif = "Orbital Spheres"
-    member this.IsPrismAurorasVisible = selectedGeometricMotif = "Prism Auroras"
-    member this.IsFloatingCrystalsVisible = selectedGeometricMotif = "Floating Crystals"
-    member this.IsStardustParticlesVisible = selectedGeometricMotif = "Stardust Particles"
-    member this.IsCyberFluxVisible = selectedGeometricMotif = "Cyber Flux"
 
     // ---------------------------------------------------------------------
     // LAYOUT & NAVIGATION
@@ -848,7 +1155,7 @@ type MainViewModel() as this =
                       SupportPromptVersion = supportPromptVersion
                       AmdMode = isAmdMode
                       PerformanceMode = isPerformanceMode
-                      OverlayDisabled = not isOverlayEnabled
+                      OverlayDisabled = not overlayDefault
                       OverlayTheme = overlayTheme
                       OverlayHotkey = overlayHotkey }
 
@@ -872,7 +1179,14 @@ type MainViewModel() as this =
                 this.RaisePropertyChanged("IsEmulatorsTabActive")
                 this.RaisePropertyChanged("IsCommunityViewVisible")
                 this.RaisePropertyChanged("IsCommunityTabActive")
+                this.RaisePropertyChanged("IsScreenTabActive")
+                if value = "screen" then
+                    screen.ApplyQuery(searchText)
+                    screen.Start()
                 this.RaisePropertyChanged("SearchPlaceholder")
+                // The search control moves between the title bar and the
+                // community filter row, so it has to hear about this.
+                this.RaisePropertyChanged("IsCommunityGridActive")
 
                 // The community grid is server-side, so it is fetched the first
                 // time the section is opened and never before - a user who
@@ -881,8 +1195,12 @@ type MainViewModel() as this =
                     community.ApplyQuery(searchText)
                     community.EnsureLoaded()
 
-                    if isPulseOpen then
+                    if communityTab = "chat" then
                         pulse.Activate(CommunityShared.isVerified community.DisplayName, community.DisplayName)
+                    elif communityTab = "gallery" then
+                        gallery.Activate(CommunityShared.isVerified community.DisplayName)
+                    elif communityTab = "dm" then
+                        dm.Activate(CommunityShared.isVerified community.DisplayName)
                 else
                     // Leaving the section stops PULSE polling straight away.
                     pulse.Deactivate()
@@ -897,6 +1215,7 @@ type MainViewModel() as this =
         | "settings" -> "Search settings..."
         | "emulators" -> "Search emulators..."
         | "community" -> "Search community..."
+        | "screen" -> "Search Screen options..."
         | _ -> "Search games..."
 
     member this.IsGamesViewVisible = activeSection = "games"
@@ -905,6 +1224,8 @@ type MainViewModel() as this =
     member this.IsGamesTabActive = activeSection = "games"
     member this.IsEmulatorsTabActive = activeSection = "emulators"
     member this.IsCommunityTabActive = activeSection = "community"
+    member this.IsScreenTabActive = activeSection = "screen"
+    member _.Screen = screen
 
     /// The community section's own state. Exposed so the window can bind to it
     /// as `Community.X` rather than mirroring three dozen properties here.
@@ -913,34 +1234,67 @@ type MainViewModel() as this =
     /// PULSE, the chat inside the community section.
     member _.Pulse = pulse
 
+    /// The gallery, the third tab.
+    member _.Gallery = gallery
+
+    /// The private chat, the fourth tab.
+    member _.Dm = dm
+
     /// The reply toast was clicked: straight to the chat.
     member this.OpenChatFromReply() =
         pulse.DismissReplyToast()
         this.ActiveSection <- "community"
         this.ShowPulse()
 
-    member _.IsPulseOpen = isPulseOpen
-    member _.IsCommunityGamesOpen = not isPulseOpen
+    member _.IsPulseOpen = communityTab = "chat"
+    member _.IsCommunityGamesOpen = communityTab = "games"
+    member _.IsGalleryOpen = communityTab = "gallery"
+    member _.IsDmOpen = communityTab = "dm"
+
+    /// The community **grid** is what is on screen right now.
+    ///
+    /// `IsCommunityGamesOpen` above only says the games tab is the one showing
+    /// inside the community section - it is true in Games and Emulators as
+    /// well, because those sections have no tabs at all. Using it to hide the
+    /// title-bar search therefore hid it everywhere except chat. This asks the
+    /// real question, and it is what the search moves against.
+    member _.IsCommunityGridActive = activeSection = "community" && communityTab = "games"
 
     /// Only decides whether a Delete link is drawn on other people's messages.
     /// The server checks the developer flag itself before removing anything.
     member private _.ViewerIsDev = CommunityShared.isVerified community.DisplayName
 
-    member this.ShowPulse() =
-        if not isPulseOpen then
-            isPulseOpen <- true
+    /// One place that moves between the three tabs, so a switch can never
+    /// leave PULSE polling behind a tab that is no longer on screen.
+    member private this.SetCommunityTab(tab: string) =
+        if communityTab <> tab then
+            communityTab <- tab
+
+            // PULSE stops polling the moment it is off screen.
+            if tab <> "chat" then pulse.Deactivate()
+
             this.RaisePropertyChanged("IsPulseOpen")
             this.RaisePropertyChanged("IsCommunityGamesOpen")
+            this.RaisePropertyChanged("IsGalleryOpen")
+            this.RaisePropertyChanged("IsDmOpen")
+            this.RaisePropertyChanged("IsCommunityGridActive")
 
+    /// Activating unconditionally is deliberate: clicking the reply toast while
+    /// the chat is already open has to start it polling again.
+    member this.ShowPulse() =
+        this.SetCommunityTab("chat")
         pulse.Activate(this.ViewerIsDev, community.DisplayName)
 
-    /// Back to the games. PULSE stops polling the moment it is off screen.
-    member this.ShowCommunityGames() =
-        if isPulseOpen then
-            isPulseOpen <- false
-            pulse.Deactivate()
-            this.RaisePropertyChanged("IsPulseOpen")
-            this.RaisePropertyChanged("IsCommunityGamesOpen")
+    /// Back to the games.
+    member this.ShowCommunityGames() = this.SetCommunityTab("games")
+
+    member this.ShowGallery() =
+        this.SetCommunityTab("gallery")
+        gallery.Activate(this.ViewerIsDev)
+
+    member this.ShowDm() =
+        this.SetCommunityTab("dm")
+        dm.Activate(this.ViewerIsDev)
 
     member this.OpenSettings() = this.ActiveSection <- "settings"
     member this.CloseSettings() = this.ActiveSection <- "games"
@@ -982,15 +1336,24 @@ type MainViewModel() as this =
         with get () = searchText
         and set value =
             if this.SetProperty(&searchText, value) then
-                filterGamesList ()
-                filterEmulatorsList ()
-                this.RaisePropertyChanged("HasGames")
-                this.RaisePropertyChanged("HasEmulators")
-                // The same box filters whichever page is open. The community
-                // list is filtered by the server, so it only re-queries while
-                // that section is the one on screen.
-                this.RaiseSettingsFilter()
-                if activeSection = "community" then community.ApplyQuery(value)
+                // One box, but only the page actually on screen does any work.
+                //
+                // Every keystroke used to re-filter the whole games library, the
+                // emulator list and all nine settings cards - even while the
+                // community grid was showing, which is filtered by the server and
+                // cares about none of them. That cost nothing while the box was
+                // hidden in this section; moving it here made it felt on every
+                // letter typed.
+                if activeSection = "community" then
+                    community.ApplyQuery(value)
+                elif activeSection = "screen" then
+                    screen.ApplyQuery(value)
+                else
+                    filterGamesList ()
+                    filterEmulatorsList ()
+                    this.RaisePropertyChanged("HasGames")
+                    this.RaisePropertyChanged("HasEmulators")
+                    this.RaiseSettingsFilter()
 
     // ---------------------------------------------------------------------
     // COLLAPSIBLE SETTINGS SECTIONS
@@ -1032,13 +1395,16 @@ type MainViewModel() as this =
         matchesCard searchText
             [ yield loc.VisualAtmosphere
               yield loc.ColorAtmosphere
-              yield loc.GeometricMotif
-              yield "visual"; yield "theme"; yield "color"; yield "motif"; yield "background"
+              yield loc.BackgroundBrightness
+              yield loc.BackgroundCustom
+              yield "visual"; yield "theme"; yield "color"; yield "background"; yield "wallpaper"
+              yield "brightness"; yield "image"; yield "picture"
               yield! loc.AtmosphereNames ]
 
     member this.ShowLibraryCard =
         matchesCard searchText [ loc.LibraryCache; loc.FastCacheGameIndex; loc.RescanLibrary; loc.ClearCache
-                                 "library"; "cache"; "scan"; "rescan"; "games"; "index" ]
+                                 "library"; "cache"; "scan"; "rescan"; "games"; "index"
+                                 "dynamic"; "dynamic library" ]
 
     member this.ShowPayloadCard =
         matchesCard searchText [ loc.ModPayloadFiles; loc.ModPayloadDesc; loc.Replace; loc.Restore
@@ -1066,7 +1432,8 @@ type MainViewModel() as this =
 
     member this.ShowAboutCard =
         matchesCard searchText [ "about"; "update"; "updates"; "version"; "credits"; "copyright"
-                                 "dlss 5 manager"; "nodix"; "numidia" ]
+                                 "dlss 5 manager"; "nodix"; "numidia"
+                                 "gpu"; "graphics"; "card"; "hardware"; "nvidia"; "rtx" ]
 
     /// Nothing on the settings page answers the query.
     member this.HasNoSettingsMatch =
@@ -1205,7 +1572,74 @@ type MainViewModel() as this =
     // ---------------------------------------------------------------------
     // SCANNING & LIBRARY MUTATION
     // ---------------------------------------------------------------------
+    // ---------------------------------------------------------------------
+    // THE GRACE PERIOD BEFORE AN AUTOMATIC SCAN
+    // ---------------------------------------------------------------------
+    //
+    // Walking a very large library takes minutes, and someone whose library
+    // never changes should not pay that on every launch. So an automatic scan
+    // now waits six seconds and says so, with a button to stop it - once, or
+    // for good. Pressing Re-scan in Settings is unaffected: that is a direct
+    // instruction and starts immediately.
+
+    member this.IsAutoScanPending = isAutoScanPending
+
+    member this.AutoScanCountdownText =
+        sprintf "Scanning your library in %d s" autoScanSecondsLeft
+
+    /// Arms the countdown, unless the scan was turned down in this version -
+    /// in which case nothing happens at all until the user asks. After an
+    /// update it asks again.
+    member this.ArmAutoScan() =
+        if GameScanner.isAutoScanDisabled UpdateChecker.CurrentVersion then
+            this.ScanStatusText <- "Automatic scan is off"
+        else
+            autoScanSecondsLeft <- 6
+            isAutoScanPending <- true
+            this.RaisePropertyChanged("IsAutoScanPending")
+            this.RaisePropertyChanged("AutoScanCountdownText")
+
+            autoScanTimer.Tick.Add(fun _ ->
+                autoScanSecondsLeft <- autoScanSecondsLeft - 1
+
+                if autoScanSecondsLeft <= 0 then
+                    autoScanTimer.Stop()
+                    isAutoScanPending <- false
+                    this.RaisePropertyChanged("IsAutoScanPending")
+                    this.StartScanAsync()
+                else
+                    this.RaisePropertyChanged("AutoScanCountdownText"))
+
+            autoScanTimer.Start()
+
+    /// Stops the countdown without deciding anything - a scan asked for by
+    /// hand does this before it starts.
+    member this.CancelAutoScan() =
+        if isAutoScanPending then
+            autoScanTimer.Stop()
+            isAutoScanPending <- false
+            this.RaisePropertyChanged("IsAutoScanPending")
+            this.ScanStatusText <- sprintf "%d Games Ready" totalGamesCount
+
+    /// "Don't scan" - remembered: no restart starts it again. Only the next
+    /// update asks once more. A scan by hand is never affected.
+    member this.DisableAutoScan() =
+        GameScanner.setAutoScanDisabled true UpdateChecker.CurrentVersion
+        this.CancelAutoScan()
+        this.ScanStatusText <- "Automatic scan is off"
+        this.RaisePropertyChanged("IsAutoScanEnabled")
+
+    /// The Settings switch, so turning it off is not a one-way door.
+    member this.IsAutoScanEnabled
+        with get () = not (GameScanner.isAutoScanDisabled UpdateChecker.CurrentVersion)
+        and set value =
+            GameScanner.setAutoScanDisabled (not value) UpdateChecker.CurrentVersion
+            this.RaisePropertyChanged("IsAutoScanEnabled")
+
     member this.StartScanAsync() =
+        // A scan asked for by hand cancels any countdown still running, rather
+        // than letting a second one start behind it.
+        this.CancelAutoScan()
         this.CloseSettings()
         if not isScanning then
             this.IsScanning <- true
@@ -1223,8 +1657,15 @@ type MainViewModel() as this =
                             Dispatcher.UIThread.Post(fun () -> this.ScanStatusText <- progress))
                         |> Async.RunSynchronously
 
+                    // Anything the user removed and asked never to see again is
+                    // dropped here, at the one place a scan produces titles.
+                    // Adding a game by hand does not come through here, so that
+                    // still works afterwards.
+                    let excluded = GameScanner.loadExcluded ()
+
                     let combined =
                         GameScanner.deduplicateGames (scannedGames @ cachedCustomGames)
+                        |> List.filter (fun g -> not (GameScanner.isExcluded excluded g))
                         |> List.sortBy (fun g -> g.Title)
 
                     GameScanner.saveGamesToCache combined
@@ -1338,6 +1779,60 @@ type MainViewModel() as this =
             |> ignore
 
     // ---------------------------------------------------------------------
+    // DOWNLOADS SHEET
+    // ---------------------------------------------------------------------
+    member this.Assets = assets
+
+    member this.IsAssetsOpen
+        with get () = isAssetsOpen
+        and set value = this.SetProperty(&isAssetsOpen, value) |> ignore
+
+    /// The download button at the top shows while any of it is missing.
+    member this.HasMissingAssets = assets.HasMissing
+    member this.IsAssetsBusy = assets.IsAnyBusy
+
+    member this.OpenAssets() = this.IsAssetsOpen <- true
+
+    /// A reminder at the bottom, ten seconds after the app opens: the add-ons
+    /// are downloaded from the button at the top. Only while something is
+    /// missing - that button is not there otherwise - and not over the sheet
+    /// itself. It goes away by itself after another ten seconds.
+    member _.IsDownloadsHintShown = downloadsHint
+
+    member this.StartDownloadsHint() =
+        let once (seconds: float) (action: unit -> unit) =
+            let t = DispatcherTimer(Interval = TimeSpan.FromSeconds(seconds))
+
+            t.Tick.Add(fun _ ->
+                t.Stop()
+                action ())
+
+            t.Start()
+
+        once 10.0 (fun () ->
+            if assets.HasMissing && not isAssetsOpen then
+                downloadsHint <- true
+                this.RaisePropertyChanged("IsDownloadsHintShown")
+                once 10.0 (fun () -> this.DismissDownloadsHint()))
+
+    member this.DismissDownloadsHint() =
+        if downloadsHint then
+            downloadsHint <- false
+            this.RaisePropertyChanged("IsDownloadsHintShown")
+
+    /// The reminder was clicked: straight to the Downloads sheet.
+    member this.OpenAssetsFromHint() =
+        this.DismissDownloadsHint()
+        this.OpenAssets()
+
+    /// Put away, whichever way: from now on the sheet waits to be asked for.
+    member this.CloseAssets() =
+        this.IsAssetsOpen <- false
+
+        if assets.HasMissing then
+            CloudAssets.postpone ()
+
+    // ---------------------------------------------------------------------
     // MANAGE SHEET
     // ---------------------------------------------------------------------
     member this.IsManageOpen
@@ -1359,12 +1854,16 @@ type MainViewModel() as this =
         and set value =
             if this.SetProperty(&isAnalyzing, value) then
                 this.RaisePropertyChanged("IsManageReady")
+                for name in [ "CanApplyDllName"; "CanRenameOptiCustom"; "CanRenameReShadeCustom" ] do
+                    this.RaisePropertyChanged(name)
 
     member this.IsInstalling
         with get () = isInstalling
         and set value =
             if this.SetProperty(&isInstalling, value) then
                 this.RaisePropertyChanged("IsManageReady")
+                for name in [ "CanApplyDllName"; "CanRenameOptiCustom"; "CanRenameReShadeCustom" ] do
+                    this.RaisePropertyChanged(name)
                 this.RaiseDlss5State()
 
     /// Buttons are only live when nothing is running.
@@ -1376,6 +1875,7 @@ type MainViewModel() as this =
     member this.IsDx12Mode = (installMode = ModInstaller.Dx12Auto)
     member this.IsDx11Mode = (installMode = ModInstaller.Dx11)
     member this.IsDx9Mode = (installMode = ModInstaller.Dx9)
+    member this.IsVulkanMode = (installMode = ModInstaller.VulkanMode)
 
     /// The user picked this route themselves, so detection must stop having an
     /// opinion. Without this, removing an install cleared `installedRoute` and
@@ -1384,6 +1884,8 @@ type MainViewModel() as this =
     member this.SetInstallMode(mode: ModInstaller.InstallMode) =
         routeChosenByUser <- true
         this.ApplyInstallMode(mode)
+        this.ApplyDeepFriedDefault()
+        this.RaiseInstallModeState()
 
     /// The same change made on the app's own initiative, which leaves the
     /// user's claim on the route alone.
@@ -1398,6 +1900,7 @@ type MainViewModel() as this =
                 | ModInstaller.Dx9 -> ModInstaller.Bit32
                 | _ -> ModInstaller.Bit64
 
+            this.ApplyDeepFriedDefault()
             this.RaiseInstallModeState()
 
     /// An emulator installs one way only, so the sheet drops the route picker,
@@ -1414,7 +1917,10 @@ type MainViewModel() as this =
                 isAmdMode <- value
                 this.RaisePropertyChanged("IsAmdModeEnabled")
                 this.RaisePropertyChanged("IsGameTarget")
+                this.RaisePropertyChanged("IsDllNameCardVisible")
                 this.RaisePropertyChanged("IsAmdRouteActive")
+                // LIVE FLOW runs on NVIDIA's network and optical flow only.
+                screen.SetAmdBlocked(value)
 
                 GameScanner.saveSettings
                     { IsSidebarLayout = isSidebarLayout
@@ -1424,7 +1930,7 @@ type MainViewModel() as this =
                       SupportPromptVersion = supportPromptVersion
                       AmdMode = isAmdMode
                       PerformanceMode = isPerformanceMode
-                      OverlayDisabled = not isOverlayEnabled
+                      OverlayDisabled = not overlayDefault
                       OverlayTheme = overlayTheme
                       OverlayHotkey = overlayHotkey }
 
@@ -1434,15 +1940,34 @@ type MainViewModel() as this =
     // ---------------------------------------------------------------------
     // IN-GAME OVERLAY
     // ---------------------------------------------------------------------
-    /// Off means no install deploys the overlay. It does not touch a game that
-    /// already has one - that comes off with the mod, like everything else.
+    /// The Manage sheet's overlay switch: off means this install leaves the
+    /// overlay out. It does not touch a game that already has one until that
+    /// game is installed again - the overlay comes off with the mod, like
+    /// everything else. The choice is also remembered as the default for the
+    /// next game not installed yet.
     member this.IsOverlayEnabled
         with get () = isOverlayEnabled
         and set value =
             if isOverlayEnabled <> value then
                 isOverlayEnabled <- value
                 this.RaisePropertyChanged("IsOverlayEnabled")
+                this.RaisePropertyChanged("IsOverlayKeyVisible")
+
+            if overlayDefault <> value then
+                overlayDefault <- value
                 this.SaveOverlaySettings()
+
+    /// The add-on itself is fetched, not installed with the program - see
+    /// `CloudAssets`. Until it is here the Manage sheet shows its option locked
+    /// with a way to get it, and an install simply leaves it out
+    /// (`deployOverlay` skips a file that is not there).
+    member this.IsOverlayDownloaded = assets.IsOverlayReady
+    member this.IsOverlayLocked = not assets.IsOverlayReady
+
+    /// The overlay's row in the CHANGE KEY card: only while there is an
+    /// overlay to open, on a route that can host it.
+    member this.IsOverlayKeyVisible =
+        isOverlayEnabled && assets.IsOverlayReady && this.IsOverlayRouteSupported
 
     /// The theme names, shown as-is: they are identities the add-on resolves,
     /// not labels, so they stay English in every language exactly like the
@@ -1475,6 +2000,299 @@ type MainViewModel() as this =
     /// change it too; whichever was set last is what the next install writes.
     member this.OverlayHotkeys = ModInstaller.overlayHotkeys
 
+    // ---- ReShade's key, the overlay's key, one click DLSS 5 -----------------
+    member _.ReShadeKeys = ModInstaller.reshadeKeys
+    member _.SelectedReShadeKey = reshadeKey
+    member _.KeysStatus = keysStatus
+    member _.HasKeysStatus = not (String.IsNullOrWhiteSpace(keysStatus))
+
+    member private this.SetKeysStatus(text: string) =
+        keysStatus <- (if isNull text then "" else text)
+        this.RaisePropertyChanged("KeysStatus")
+        this.RaisePropertyChanged("HasKeysStatus")
+
+    // ---- DLL NAME: rename the OptiScaler / ReShade proxy after an install ----
+    // The install still chooses the name itself, exactly as before; this only
+    // moves the file afterwards, and only when the user asks.
+    member _.IsDllNamesOpen = dllNamesOpen
+
+    member _.DllNamesIcon =
+        if dllNamesOpen then "M 7,14 L 12,9 L 17,14 Z" else "M 7,10 L 12,15 L 17,10 Z"
+
+    member this.ToggleDllNames() =
+        dllNamesOpen <- not dllNamesOpen
+        if dllNamesOpen then this.RefreshDllNames()
+        this.RaisePropertyChanged("IsDllNamesOpen")
+        this.RaisePropertyChanged("DllNamesIcon")
+
+    /// Is this name already a file in the proxy's folder - and not the proxy
+    /// itself? Such a name belongs to the game and is never offered.
+    member private _.IsNameTaken(name: string, current: string) =
+        let n = if isNull name then "" else name.ToLowerInvariant()
+        n <> "" && dllFolderNames.Contains n && not (n = current.ToLowerInvariant())
+
+    member private this.ApplyDllNames(info: ModInstaller.ProxyNamesInfo) =
+        optiProxyName <- (if isNull info.OptiName then "" else info.OptiName)
+        reshadeProxyName <- (if isNull info.ReShadeName then "" else info.ReShadeName)
+
+        dllFolderNames <-
+            (if isNull info.FolderDlls then Set.empty
+             else info.FolderDlls |> Array.map (fun n -> n.ToLowerInvariant()) |> Set.ofArray)
+
+        dllNamesKnown <- true
+
+        // Only the names that are free - plus the one in use, so the list
+        // shows where it stands.
+        let free (names: string[]) (current: string) =
+            names |> Array.filter (fun n -> not (this.IsNameTaken(n, current)))
+
+        optiChoices <- free ModInstaller.optiScalerProxyNames optiProxyName
+        reshadeChoices <- free ModInstaller.reShadeProxyNames reshadeProxyName
+
+        let pick (choices: string[]) (current: string) (previous: string) =
+            match choices |> Array.tryFind (fun x -> x.Equals(current, StringComparison.OrdinalIgnoreCase)) with
+            | Some n -> n
+            | None ->
+                if choices |> Array.contains previous then previous
+                elif choices.Length > 0 then choices.[0]
+                else previous
+
+        optiProxyPick <- pick optiChoices optiProxyName optiProxyPick
+        reshadeProxyPick <- pick reshadeChoices reshadeProxyName reshadeProxyPick
+
+        for name in
+            [ "OptiProxyNames"; "ReShadeProxyNames"; "HasOptiProxy"; "OptiProxyName"; "HasReShadeProxy"
+              "ReShadeProxyName"; "HasNoProxy"; "SelectedOptiProxyName"; "SelectedReShadeProxyName"
+              "IsDllNameCardVisible"; "IsEmulatorDllNameVisible"; "IsEmulatorVulkanLayer"
+              "CanRenameOptiCustom"; "CanRenameReShadeCustom"; "IsOptiCustomTaken"; "IsReShadeCustomTaken"
+              "CanApplyDllName" ] do
+            this.RaisePropertyChanged(name)
+
+    /// The names for the open game: from the cache at once when it still
+    /// matches the install record, otherwise read in the background (after an
+    /// install, a switch, a rename, or the sheet's refresh button).
+    member this.RefreshDllNames() =
+        dllScanGeneration <- dllScanGeneration + 1
+        let generation = dllScanGeneration
+
+        match manageCard with
+        | None ->
+            dllNamesKnown <- false
+            this.RaisePropertyChanged("IsDllNameCardVisible")
+        | Some card ->
+            let game = card.Game
+
+            match ModInstaller.tryCachedProxyNames game with
+            | Some info -> this.ApplyDllNames(info)
+            | None ->
+                dllNamesKnown <- false
+                this.RaisePropertyChanged("IsDllNameCardVisible")
+                this.RaisePropertyChanged("IsEmulatorVulkanLayer")
+
+                System.Threading.Tasks.Task.Run(fun () ->
+                    let info = ModInstaller.proxyNames game
+
+                    Dispatcher.UIThread.Post(fun () ->
+                        // Only if nothing newer was asked for meanwhile, and the
+                        // sheet still shows that game.
+                        let sameGame =
+                            match manageCard with
+                            | Some c -> obj.ReferenceEquals(c, card)
+                            | None -> false
+
+                        if generation = dllScanGeneration && sameGame then this.ApplyDllNames(info)))
+                |> ignore
+
+    member _.OptiProxyNames = optiChoices
+    member _.ReShadeProxyNames = reshadeChoices
+    member _.HasOptiProxy = optiProxyName <> ""
+    member _.OptiProxyName = optiProxyName
+    member _.HasReShadeProxy = reshadeProxyName <> ""
+    member _.ReShadeProxyName = reshadeProxyName
+    member _.HasNoProxy = optiProxyName = "" && reshadeProxyName = ""
+
+    /// Not offered at all before the mod is on the game: there is nothing to
+    /// rename until an install has put a proxy there.
+    member this.IsDllNameCardVisible =
+        // Not while the sheet offers a switch: the names shown would belong to
+        // the install that is about to be removed, not to the one being picked.
+        not this.IsSwitchingRoute
+        && dllNamesKnown
+        && ((this.IsGameTarget && not this.HasNoProxy) || this.IsEmulatorDllNameVisible)
+
+    /// Emulators: ReShade is renamed like on a game when it went in on the
+    /// DirectX slot (a DLL beside the emulator). On Vulkan it is a layer and
+    /// there is no DLL - the card still shows, and says so.
+    member _.IsEmulatorDllNameVisible = isEmulatorTarget && installedRoute = "emulator"
+
+    member this.IsEmulatorVulkanLayer = dllNamesKnown && this.IsEmulatorDllNameVisible && reshadeProxyName = ""
+
+    member this.SelectedOptiProxyName
+        with get () = optiProxyPick
+        and set (value: string) = if not (isNull value) then this.SetProperty(&optiProxyPick, value) |> ignore
+
+    member this.SelectedReShadeProxyName
+        with get () = reshadeProxyPick
+        and set (value: string) = if not (isNull value) then this.SetProperty(&reshadeProxyPick, value) |> ignore
+
+    member this.OptiCustomName
+        with get () = optiCustomName
+        and set (value: string) =
+            if this.SetProperty(&optiCustomName, (if isNull value then "" else value)) then
+                this.RaisePropertyChanged("CanRenameOptiCustom")
+                this.RaisePropertyChanged("IsOptiCustomTaken")
+
+    member this.ReShadeCustomName
+        with get () = reshadeCustomName
+        and set (value: string) =
+            if this.SetProperty(&reshadeCustomName, (if isNull value then "" else value)) then
+                this.RaisePropertyChanged("CanRenameReShadeCustom")
+                this.RaisePropertyChanged("IsReShadeCustomTaken")
+
+    /// The typed name is already a file in the game folder: said under the
+    /// box, and Apply stays off. The installer refuses it too, on its own.
+    member this.IsOptiCustomTaken = this.IsNameTaken(ModInstaller.normalizeProxyName optiCustomName, optiProxyName)
+    member this.IsReShadeCustomTaken = this.IsNameTaken(ModInstaller.normalizeProxyName reshadeCustomName, reshadeProxyName)
+
+    member this.CanApplyDllName = not isInstalling && not isAnalyzing && not dllBusy
+
+    member this.CanRenameOptiCustom =
+        this.CanApplyDllName && ModInstaller.normalizeProxyName optiCustomName <> "" && not this.IsOptiCustomTaken
+
+    member this.CanRenameReShadeCustom =
+        this.CanApplyDllName && ModInstaller.normalizeProxyName reshadeCustomName <> "" && not this.IsReShadeCustomTaken
+
+    member _.DllNameStatus = dllNameStatus
+    member _.HasDllNameStatus = not (String.IsNullOrWhiteSpace(dllNameStatus))
+
+    member _.DllNameStatusBrush: IBrush =
+        if dllNameIsError then SolidColorBrush(Color.Parse("#F87171")) :> IBrush
+        else SolidColorBrush(Color.Parse("#86EFAC")) :> IBrush
+
+    /// The move itself runs off the UI thread too; the names are read again
+    /// afterwards (the install record changed, so the cache no longer matches).
+    member private this.RenameProxy(kind: ModInstaller.ProxyKind, name: string) =
+        match manageCard with
+        | Some card when this.CanApplyDllName ->
+            dllBusy <- true
+            this.RaisePropertyChanged("CanApplyDllName")
+            this.RaisePropertyChanged("CanRenameOptiCustom")
+            this.RaisePropertyChanged("CanRenameReShadeCustom")
+            let game = card.Game
+
+            System.Threading.Tasks.Task.Run(fun () ->
+                let outcome = ModInstaller.renameProxy game kind name
+
+                Dispatcher.UIThread.Post(fun () ->
+                    dllBusy <- false
+                    dllNameStatus <- outcome.Message
+                    dllNameIsError <- not outcome.Success
+                    this.RefreshDllNames()
+                    this.RaisePropertyChanged("DllNameStatus")
+                    this.RaisePropertyChanged("HasDllNameStatus")
+                    this.RaisePropertyChanged("DllNameStatusBrush")
+                    this.RaisePropertyChanged("CanApplyDllName")
+                    this.RaisePropertyChanged("CanRenameOptiCustom")
+                    this.RaisePropertyChanged("CanRenameReShadeCustom")))
+            |> ignore
+        | _ -> ()
+
+    member this.RenameOptiToPick() = this.RenameProxy(ModInstaller.OptiScalerProxyDll, optiProxyPick)
+    member this.RenameReShadeToPick() = this.RenameProxy(ModInstaller.ReShadeProxyDll, reshadeProxyPick)
+    member this.RenameOptiToCustom() = this.RenameProxy(ModInstaller.OptiScalerProxyDll, optiCustomName)
+    member this.RenameReShadeToCustom() = this.RenameProxy(ModInstaller.ReShadeProxyDll, reshadeCustomName)
+
+    /// The folder of the game whose sheet is open, when it has an install for
+    /// the keys to be written into - "" otherwise.
+    member private this.InstalledGameDir =
+        match manageCard with
+        | Some card when ModInstaller.installedMode card.Game <> "" ->
+            try
+                System.IO.Path.GetDirectoryName(card.ExecutablePath)
+            with _ ->
+                ""
+        | _ -> ""
+
+    /// Picked from the sheet: kept for every install from now on and, on a game
+    /// that already has one, written in straight away - that install has long
+    /// finished, so there is nothing for the change to race.
+    member this.ChooseReShadeKey(name: string) =
+        if ModInstaller.reshadeKeys |> Array.contains name then
+            if name.Equals(overlayHotkey, StringComparison.OrdinalIgnoreCase) then
+                this.SetKeysStatus("That key already opens the overlay - pick another one for ReShade.")
+            else
+                reshadeKey <- name
+                ModInstaller.saveReShadeKey name
+                this.RaisePropertyChanged("SelectedReShadeKey")
+
+                match this.InstalledGameDir with
+                | "" -> this.SetKeysStatus("")
+                | dir ->
+                    ModInstaller.applyReShadeKey dir name
+                    this.SetKeysStatus("ReShade now opens with " + name + " in this game.")
+
+    member this.ChooseOverlayKey(binding: string) =
+        if binding.Equals(reshadeKey, StringComparison.OrdinalIgnoreCase) then
+            this.SetKeysStatus("That key already opens ReShade - pick another one for the overlay.")
+        else
+            this.SelectedOverlayHotkey <- binding
+
+            match this.InstalledGameDir with
+            | "" -> this.SetKeysStatus("")
+            | dir ->
+                ModInstaller.applyOverlayKey dir binding
+                this.SetKeysStatus("The overlay now opens with " + binding + " in this game.")
+
+    /// Called once an install has fully finished: the chosen keys go in last,
+    /// after ReShade's setup has written the files they live in.
+    member private this.ApplyKeysToInstall() =
+        match this.InstalledGameDir with
+        | "" -> ()
+        | dir ->
+            ModInstaller.applyReShadeKey dir reshadeKey
+            ModInstaller.applyOverlayKey dir overlayHotkey
+            // The OptiScaler route's own menu key. It writes nothing unless an
+            // OptiScaler.ini is there, so the other routes are untouched.
+            ModInstaller.applyOptiScalerMenuKey dir optiMenuKey
+
+    // ---- OptiScaler's own menu key -----------------------------------------
+    member _.OptiMenuKeys = ModInstaller.optiMenuKeys
+    member _.SelectedOptiMenuKey = optiMenuKey
+    member _.OptiKeyStatus = optiKeyStatus
+    member _.HasOptiKeyStatus = not (String.IsNullOrWhiteSpace(optiKeyStatus))
+
+    /// Picked from the OptiScaler route: kept for every install from now on
+    /// and, on a game that already has one, written into its OptiScaler.ini
+    /// straight away - that install has long finished, so nothing races it.
+    member this.ChooseOptiMenuKey(name: string) =
+        if ModInstaller.optiMenuKeys |> Array.contains name then
+            optiMenuKey <- name
+            ModInstaller.saveOptiMenuKey name
+            this.RaisePropertyChanged("SelectedOptiMenuKey")
+
+            let written =
+                match this.InstalledGameDir with
+                | "" -> false
+                | dir ->
+                    let ini = System.IO.Path.Combine(dir, "OptiScaler.ini")
+
+                    if System.IO.File.Exists(ini) then
+                        ModInstaller.applyOptiScalerMenuKey dir name
+                        true
+                    else
+                        false
+
+            optiKeyStatus <-
+                if written then
+                    "OptiScaler's menu now opens with "
+                    + (if name = "Auto" then "Insert" else name)
+                    + " in this game."
+                else
+                    ""
+
+            this.RaisePropertyChanged("OptiKeyStatus")
+            this.RaisePropertyChanged("HasOptiKeyStatus")
+
     member this.SelectedOverlayHotkey
         with get () = overlayHotkey
         and set (value: string) =
@@ -1492,7 +2310,7 @@ type MainViewModel() as this =
               SupportPromptVersion = supportPromptVersion
               AmdMode = isAmdMode
               PerformanceMode = isPerformanceMode
-              OverlayDisabled = not isOverlayEnabled
+              OverlayDisabled = not overlayDefault
               OverlayTheme = overlayTheme
               OverlayHotkey = overlayHotkey }
 
@@ -1500,6 +2318,12 @@ type MainViewModel() as this =
     /// whether the overlay is coming along.
     member this.IsOverlayRouteSupported =
         ModInstaller.overlaySupported installMode optiApi
+
+    /// The CHANGE KEY card: OptiScaler's menu key on its own route, ReShade's
+    /// and the overlay's on the routes that put a ReShade in the game - which
+    /// are exactly the ones `overlaySupported` answers yes for.
+    member this.IsKeysCardVisible =
+        this.IsOptiScalerMode || this.IsOverlayRouteSupported
 
     member this.OverlayOptions: ModInstaller.OverlayOptions =
         { Enabled = isOverlayEnabled
@@ -1513,6 +2337,11 @@ type MainViewModel() as this =
     /// OptiScaler is the only route where the game's API changes anything.
     member this.IsOptiApiChoiceVisible =
         not isEmulatorTarget && installMode = ModInstaller.OptiScalerMode
+
+    /// An emulator installs one way, but on either of two slots: ReShade hooks
+    /// the Vulkan layer or the DirectX one. That is the only choice its sheet
+    /// offers, and it rides in on the same `optiApi` field.
+    member this.IsEmulatorApiChoiceVisible = isEmulatorTarget
 
     member this.IsOptiDx12 = (optiApi = ModInstaller.OptiDx12)
     member this.IsOptiVulkan = (optiApi = ModInstaller.OptiVulkan)
@@ -1540,7 +2369,8 @@ type MainViewModel() as this =
         && (isAmdMode
             || installMode = ModInstaller.Dx12Auto
             || installMode = ModInstaller.Dx11
-            || installMode = ModInstaller.Dx9)
+            || installMode = ModInstaller.Dx9
+            || installMode = ModInstaller.VulkanMode)
 
     member this.IsNeuralAddonOn = useNeuralAddon
     member this.IsNeuralAddonOff = not useNeuralAddon
@@ -1568,6 +2398,33 @@ type MainViewModel() as this =
             || installMode = ModInstaller.Dx9)
         && not (ModInstaller.archMatters installMode && installArch = ModInstaller.Bit32)
 
+    /// MFG unlock is offered wherever it means something: the RenoDX routes,
+    /// and the Vulkan route - which carries no RenoDX but still takes it.
+    /// Multipass and deep-fried stay tied to `IsRenoDxOptionsVisible`, because
+    /// both only decide what happens to RenoDX itself.
+    member this.IsMfgUnlockVisible = this.IsRenoDxOptionsVisible || this.IsVulkanMode
+
+    /// DX9 on a 32-bit game. The payload still goes in, but not where RenoDX
+    /// would have been: a 32-bit game cannot load a single 64-bit module, so it
+    /// travels into host64 beside the game with the rest of them.
+    member this.IsDeepFriedHost64 =
+        not isEmulatorTarget
+        && not isAmdMode
+        && (installMode = ModInstaller.Dx9 || installMode = ModInstaller.Dx11)
+        && installArch = ModInstaller.Bit32
+
+    /// Offered on the RenoDX routes, on 32-bit where it stands alone, and on
+    /// Vulkan, where it is the effect itself.
+    member this.IsDeepFriedVisible = this.IsRenoDxOptionsVisible || this.IsDeepFriedHost64 || this.IsVulkanMode
+
+    /// The same switch does two different things, so it says two different
+    /// things. On DX9 32-bit there is no RenoDX for it to replace - it goes in
+    /// beside the 64-bit modules, and it is there to help the game run at all.
+    member this.DeepFriedHint =
+        if this.IsDeepFriedHost64 then loc.TipDeepFriedHost64
+        elif this.IsVulkanMode then loc.TipDeepFriedVulkan
+        else loc.TipDeepFried
+
     member this.IsMfgUnlockOn = useMfgUnlock
     member this.IsMfgUnlockOff = not useMfgUnlock
 
@@ -1583,6 +2440,43 @@ type MainViewModel() as this =
         if useMultipass <> on then
             useMultipass <- on
             this.RaiseInstallModeState()
+
+    /// Deep-fried chicken goes in where RenoDX would have, so Multipass - which
+    /// only decides which RenoDX build to use - is switched off with it and
+    /// greys out until it is switched back off.
+    member this.IsDeepFriedOn = useDeepFried
+    member this.IsDeepFriedOff = not useDeepFried
+    member this.IsMultipassAvailable = not useDeepFried
+
+    member this.SetDeepFried(on: bool) =
+        if useDeepFried <> on then
+            useDeepFried <- on
+            if on then useMultipass <- false
+            this.RaiseInstallModeState()
+
+    /// On DX9 32-bit the payload is the point of the route, so it arrives
+    /// switched on. Only when the user picks that combination themselves -
+    /// reopening a sheet restores whatever was actually installed, and turning
+    /// it off afterwards has to stick.
+    member private this.ApplyDeepFriedDefault() =
+        // Never over an install that is already there. The sheet has just
+        // restored what that install actually used, and switching this on
+        // underneath would offer to "change" something nobody touched.
+        if installedRoute = "" then
+            // On 32-bit the payload is the point of the route, so it arrives
+            // on. Everywhere else it is an option, and an option that switches
+            // itself on is not one - so changing route or build settles it
+            // either way rather than carrying the last answer across.
+            let wanted = this.IsDeepFriedHost64 || this.IsVulkanMode
+
+            if wanted <> useDeepFried then
+                useDeepFried <- wanted
+                if wanted then useMultipass <- false
+
+    member this.IsDeepFriedInstalled =
+        installedDeepFried
+        && installedRoute <> ""
+        && installedRoute = ModInstaller.modeKey installMode
 
     /// Same rule as the neural dot: live only on the route it was recorded with.
     member this.IsMfgUnlockInstalled =
@@ -1601,6 +2495,7 @@ type MainViewModel() as this =
     member this.SetInstallArch(arch: ModInstaller.InstallArch) =
         if installArch <> arch then
             installArch <- arch
+            this.ApplyDeepFriedDefault()
             this.RaiseInstallModeState()
 
     member private this.RaiseInstallModeState() =
@@ -1608,6 +2503,9 @@ type MainViewModel() as this =
         this.RaisePropertyChanged("IsDx12Mode")
         this.RaisePropertyChanged("IsDx11Mode")
         this.RaisePropertyChanged("IsDx9Mode")
+        this.RaisePropertyChanged("IsVulkanMode")
+        this.RaisePropertyChanged("IsVulkanInstalled")
+        this.RaisePropertyChanged("IsMfgUnlockVisible")
         this.RaisePropertyChanged("IsArchChoiceVisible")
         this.RaisePropertyChanged("IsOptiApiChoiceVisible")
         this.RaisePropertyChanged("IsOptiDx12")
@@ -1615,13 +2513,22 @@ type MainViewModel() as this =
         this.RaisePropertyChanged("IsOptiNeural")
         this.RaisePropertyChanged("IsNeuralAddonVisible")
         this.RaisePropertyChanged("IsOverlayRouteSupported")
+        this.RaisePropertyChanged("IsKeysCardVisible")
+        this.RaisePropertyChanged("IsOverlayKeyVisible")
         this.RaisePropertyChanged("IsNeuralAddonOn")
         this.RaisePropertyChanged("IsNeuralAddonOff")
         this.RaisePropertyChanged("IsRenoDxOptionsVisible")
+        this.RaisePropertyChanged("IsDeepFriedHost64")
+        this.RaisePropertyChanged("IsDeepFriedVisible")
+        this.RaisePropertyChanged("DeepFriedHint")
         this.RaisePropertyChanged("IsMfgUnlockOn")
         this.RaisePropertyChanged("IsMfgUnlockOff")
         this.RaisePropertyChanged("IsMultipassOn")
         this.RaisePropertyChanged("IsMultipassOff")
+        this.RaisePropertyChanged("IsMultipassAvailable")
+        this.RaisePropertyChanged("IsDeepFriedOn")
+        this.RaisePropertyChanged("IsDeepFriedOff")
+        this.RaisePropertyChanged("IsEmulatorApiChoiceVisible")
         this.RaisePropertyChanged("IsBit64")
         this.RaisePropertyChanged("IsBit32")
         this.RaisePropertyChanged("InstallModeHintText")
@@ -1631,19 +2538,205 @@ type MainViewModel() as this =
     // ---------------------------------------------------------------------
     // WHAT THE GAME IS
     // ---------------------------------------------------------------------
+    /// What the game renders with. A title that offers two - Red Dead
+    /// Redemption 2 is the obvious one - says both rather than picking a
+    /// winner, because both are true and the choice is the player's.
     member this.DetectedApiText =
-        match detectedApi with
-        | "dx12" -> "DirectX 12"
-        | "dx11" -> "DirectX 11"
-        | "dx10" -> "DirectX 10"
-        | "dx9" -> "DirectX 9"
-        | _ -> "Unknown API"
+        let label api =
+            match api with
+            | "dx12" -> "DirectX 12"
+            | "dx11" -> "DirectX 11"
+            | "dx10" -> "DirectX 10"
+            | "dx9" -> "DirectX 9"
+            | "vulkan" -> "Vulkan"
+            | "opengl" -> "OpenGL"
+            | _ -> ""
+
+        let names =
+            detectedApis
+            |> Array.map label
+            |> Array.filter (fun s -> s <> "")
+
+        if names.Length = 0 then "Unknown API" else String.Join(" + ", names)
 
     member this.DetectedArchText =
         match detectedArch with
         | "32" -> "32-bit"
         | "64" -> "64-bit"
         | _ -> ""
+
+
+    // =======================================================================
+    // COMMUNITY AT A GLANCE
+    // =======================================================================
+
+    /// Folded away until asked for: it is one request to the community, and a
+    /// sheet that is opened to press Install should not make it.
+    member this.IsCommunityGlanceOpen
+        with get () = glanceOpen
+        and set value =
+            if this.SetProperty(&glanceOpen, value) then
+                this.RaisePropertyChanged("CommunityGlanceIcon")
+                if value then this.LoadCommunityGlance()
+
+    member this.ToggleCommunityGlance() =
+        this.IsCommunityGlanceOpen <- not glanceOpen
+
+    /// Closed and blank, for the next game.
+    member private this.ResetCommunityGlance() =
+        glanceOpen <- false
+        glanceBusy <- false
+        glanceFor <- ""
+        glanceGame <- None
+        glanceMessage <- ""
+
+        for name in
+            [ "IsCommunityGlanceOpen"; "CommunityGlanceIcon"; "IsCommunityGlanceBusy"; "HasCommunityGlance"
+              "CommunityGlanceMessage"; "HasCommunityGlanceMessage"; "CommunityGlanceWorking"
+              "CommunityGlanceMixed"; "CommunityGlanceBroken"; "CommunityGlanceReports"
+              "CommunityGlanceTitle" ] do
+            this.RaisePropertyChanged(name)
+
+    /// Ask again for this game, past whatever was remembered - for when the
+    /// answer has moved on since.
+    member this.RefreshCommunityGlance() =
+        match manageCard with
+        | Some card ->
+            glanceCache.Remove(card.Title) |> ignore
+            glanceFor <- ""
+            this.LoadCommunityGlance()
+        | None -> ()
+
+    member this.CommunityGlanceIcon =
+        if glanceOpen then "M 7,14 L 12,9 L 17,14 Z" else "M 7,10 L 12,15 L 17,10 Z"
+
+    member _.IsCommunityGlanceBusy = glanceBusy
+    member _.HasCommunityGlance = glanceGame.IsSome
+    member _.CommunityGlanceMessage = glanceMessage
+    member _.HasCommunityGlanceMessage = not (String.IsNullOrWhiteSpace(glanceMessage))
+
+    /// How many people it worked for, and how many it did not. "Mixed" is
+    /// counted with the ones it worked for nowhere: it is its own answer.
+    member _.CommunityGlanceWorking =
+        match glanceGame with
+        | Some g -> string g.Working
+        | None -> "0"
+
+    member _.CommunityGlanceMixed =
+        match glanceGame with
+        | Some g -> string g.Mixed
+        | None -> "0"
+
+    member _.CommunityGlanceBroken =
+        match glanceGame with
+        | Some g -> string g.Broken
+        | None -> "0"
+
+    member _.CommunityGlanceReports =
+        match glanceGame with
+        | Some g -> sprintf "%d" g.Reports
+        | None -> "0"
+
+    member _.CommunityGlanceTitle =
+        match glanceGame with
+        | Some g -> g.Title
+        | None -> ""
+
+    /// The one request. The community keys games by its own id, so the local
+    /// title is searched for and the best match taken - the same scorer the
+    /// cover matcher uses, so "Hitman: Blood Money" and "HITMAN BLOOD MONEY"
+    /// are one game and "Hitman 3" is not.
+    member private this.LoadCommunityGlance() =
+        let title =
+            match manageCard with
+            | Some card -> card.Title
+            | None -> ""
+
+        let raiseGlance () =
+            for name in
+                [ "IsCommunityGlanceBusy"; "HasCommunityGlance"; "CommunityGlanceMessage"
+                  "HasCommunityGlanceMessage"; "CommunityGlanceWorking"; "CommunityGlanceMixed"
+                  "CommunityGlanceBroken"; "CommunityGlanceReports"; "CommunityGlanceTitle" ] do
+                this.RaisePropertyChanged(name)
+
+        let remember (key: string) (value: CommunityApi.GameDto option) =
+            if not (glanceCache.ContainsKey(key)) then
+                glanceOrder.Enqueue(key)
+
+                while glanceOrder.Count > 30 do
+                    let oldest = glanceOrder.Dequeue()
+                    glanceCache.Remove(oldest) |> ignore
+
+            glanceCache[key] <- value
+
+        if String.IsNullOrWhiteSpace(title) then
+            glanceMessage <- ""
+        elif glanceFor = title && (glanceGame.IsSome || glanceBusy) then
+            ()   // already have it, or it is on its way
+        elif glanceCache.ContainsKey(title) then
+            // Asked before, this session: nothing goes over the wire.
+            glanceFor <- title
+            glanceBusy <- false
+            glanceGame <- glanceCache[title]
+            glanceMessage <- (if glanceGame.IsSome then "" else Localization.current.CommunityGlanceNone)
+            raiseGlance ()
+        else
+            glanceFor <- title
+            glanceGame <- None
+            glanceBusy <- true
+            glanceMessage <- ""
+            this.RaisePropertyChanged("IsCommunityGlanceBusy")
+            this.RaisePropertyChanged("HasCommunityGlance")
+            this.RaisePropertyChanged("CommunityGlanceMessage")
+            this.RaisePropertyChanged("HasCommunityGlanceMessage")
+
+            System.Threading.Tasks.Task.Run(fun () ->
+                let outcome =
+                    try CommunityApi.listGames title "" "" 0 8
+                    with ex -> Error ex.Message
+
+                Dispatcher.UIThread.Post(fun () ->
+                    // The sheet may have moved on to another game while this
+                    // was in flight; the answer for the old one is dropped.
+                    if glanceFor = title then
+                        glanceBusy <- false
+
+                        match outcome with
+                        | Ok(list, _) ->
+                            let best =
+                                list
+                                |> Array.filter (fun g -> not (isNull g.Title))
+                                |> Array.map (fun g -> g, SteamCovers.score title g.Title)
+                                |> Array.sortByDescending snd
+                                |> Array.tryHead
+
+                            match best with
+                            | Some(g, points) when points >= 60 ->
+                                glanceGame <- Some g
+                                glanceMessage <- ""
+                                remember title (Some g)
+                            | _ ->
+                                glanceGame <- None
+                                glanceMessage <- Localization.current.CommunityGlanceNone
+                                remember title None
+                        | Error text ->
+                            // A failure is not remembered: the next look should
+                            // try again rather than repeat the error.
+                            glanceGame <- None
+                            glanceMessage <- text
+
+                        raiseGlance ()))
+            |> ignore
+
+    /// Into the community, at this game, with its reports open.
+    member this.OpenGlanceInCommunity() =
+        match glanceGame with
+        | Some dto ->
+            this.IsManageOpen <- false
+            this.ActiveSection <- "community"
+            this.SetCommunityTab("games")
+            community.OpenGame(CommunityGameViewModel(dto))
+        | None -> ()
 
     /// Folds the executable / ReShade / DLSS / Streamline readout away.
     member this.IsTargetDetailsOpen
@@ -1670,7 +2763,11 @@ type MainViewModel() as this =
 
         if not sameTarget then
             detectedFor <- manageExePath
-            detectedApi <- GameAnalyzer.detectGraphicsApi manageExePath
+            // One read of the executable answers both questions: the whole list
+            // is what the sheet shows, and its first entry - the newest DirectX
+            // generation when there is one - is what the routing decides on.
+            detectedApis <- GameAnalyzer.detectGraphicsApis manageExePath
+            detectedApi <- (if detectedApis.Length > 0 then detectedApis.[0] else "")
             detectedArch <- GameAnalyzer.detectArchitecture manageExePath
 
         let dlssFilesFound =
@@ -1716,12 +2813,13 @@ type MainViewModel() as this =
 
     member this.InstallModeHintText =
         match installMode with
-        | ModInstaller.OptiScalerMode -> "OptiScaler hooks the game directly. ReShade is not used."
-        | ModInstaller.Dx12Auto -> "ReShade + RenoDX with the DLSS 5 effects."
-        | ModInstaller.Dx11 -> "ReShade + RenoDX with the DLSS 5 effects."
-        | ModInstaller.Dx9 -> "dgVoodoo translates Direct3D 9; ReShade moves to the dxgi slot."
-        | ModInstaller.Emulator -> "ReShade on Vulkan with the DLSS 5 emulator payload."
-        | ModInstaller.AmdMode -> "AMD RDNA 4: the AMD payload and the ray reconstruction model, nothing else."
+        | ModInstaller.OptiScalerMode -> loc.HintRouteOptiScaler
+        | ModInstaller.Dx12Auto -> loc.HintRouteRenoDx
+        | ModInstaller.VulkanMode -> loc.HintRouteVulkan
+        | ModInstaller.Dx11 -> loc.HintRouteRenoDx
+        | ModInstaller.Dx9 -> loc.HintRouteDx9
+        | ModInstaller.Emulator -> loc.HintRouteEmulator
+        | ModInstaller.AmdMode -> loc.HintRouteAmd
 
     member this.IsModInstalled
         with get () = isModInstalled
@@ -1747,7 +2845,9 @@ type MainViewModel() as this =
             // RenoDX options.
             || (this.IsNeuralAddonVisible && installedNeural <> useNeuralAddon)
             || (this.IsRenoDxOptionsVisible
-                && (installedMfgUnlock <> useMfgUnlock || installedMultipass <> useMultipass)))
+                && (installedMfgUnlock <> useMfgUnlock
+                    || installedMultipass <> useMultipass
+                    || installedDeepFried <> useDeepFried)))
 
     member this.ShowInstallButton = not dlss5Present && not isInstalling
     member this.ShowSwitchButton = this.IsSwitchingRoute && not isInstalling
@@ -1764,6 +2864,7 @@ type MainViewModel() as this =
     member this.IsDx12Installed = installedRoute = "dx12"
     member this.IsDx11Installed = installedRoute = "dx11"
     member this.IsDx9Installed = installedRoute = "dx9"
+    member this.IsVulkanInstalled = installedRoute = "vulkan"
 
     /// Marks the build in use, but only for the route that is actually on.
     member this.IsBit64Installed =
@@ -1782,6 +2883,7 @@ type MainViewModel() as this =
             | ModInstaller.Dx12Auto -> "DX12"
             | ModInstaller.Dx11 -> "DX11"
             | ModInstaller.Dx9 -> "DX9"
+            | ModInstaller.VulkanMode -> "Vulkan"
 
             | ModInstaller.Emulator -> "Emulator"
 
@@ -1792,21 +2894,13 @@ type MainViewModel() as this =
         // which way the switch is going.
         // One option is named; several are counted, so the text always fits
         // the button instead of running out past the edge of the sheet.
-        let options =
-            [ if this.IsNeuralAddonVisible && useNeuralAddon then "neural"
-              if this.IsRenoDxOptionsVisible && useMfgUnlock then "MFG unlock"
-              if this.IsRenoDxOptionsVisible && useMultipass then "multipass" ]
-
-        let suffix =
-            match options with
-            | [] -> ""
-            | [ one ] -> " + " + one
-            | many -> sprintf " + %d options" many.Length
-
+        // No option list on the button. It is a narrow control in a fixed-width
+        // sheet, and any suffix - even a short one - ran out past its edge. The
+        // options are on screen directly above it anyway.
         if ModInstaller.archMatters installMode then
-            sprintf "Switch to %s %s-bit%s" route (ModInstaller.archKey installArch) suffix
+            sprintf "Switch to %s %s-bit" route (ModInstaller.archKey installArch)
         else
-            "Switch to " + route + suffix
+            "Switch to " + route
 
     member this.ManageDlss5Text =
         if not dlss5Present then loc.NotInstalled
@@ -1828,6 +2922,7 @@ type MainViewModel() as this =
         this.RaisePropertyChanged("ShowUninstallButton")
         this.RaisePropertyChanged("SwitchButtonText")
         this.RaisePropertyChanged("IsSwitchingRoute")
+        this.RaisePropertyChanged("IsDllNameCardVisible")
         this.RaisePropertyChanged("IsOptiScalerInstalled")
         this.RaisePropertyChanged("IsDx12Installed")
         this.RaisePropertyChanged("IsDx11Installed")
@@ -1840,6 +2935,7 @@ type MainViewModel() as this =
         this.RaisePropertyChanged("IsNeuralAddonInstalled")
         this.RaisePropertyChanged("IsMfgUnlockInstalled")
         this.RaisePropertyChanged("IsMultipassInstalled")
+        this.RaisePropertyChanged("IsDeepFriedInstalled")
         this.RaisePropertyChanged("ManageDlss5Text")
         this.RaisePropertyChanged("ManageDlss5Brush")
 
@@ -1855,9 +2951,39 @@ type MainViewModel() as this =
         with get () = installResultText
         and set value =
             if this.SetProperty(&installResultText, value) then
-                this.RaisePropertyChanged("HasInstallResult")
+                // Every new result arrives folded, whatever the last one was.
+                isInstallResultExpanded <- false
+
+                for name in
+                    [ "HasInstallResult"; "InstallResultSummary"; "HasInstallResultDetails"
+                      "IsInstallResultExpanded"; "InstallResultToggleText" ] do
+                    this.RaisePropertyChanged(name)
 
     member this.HasInstallResult = not (String.IsNullOrWhiteSpace(installResultText))
+
+    /// The headline alone: everything before the first bullet. "Switched. DX12
+    /// 64-bit - ReShade + DLSS 5 installed" rather than the whole deployment
+    /// log, which is what used to widen the sheet to fit it.
+    member this.InstallResultSummary =
+        let text = if isNull installResultText then "" else installResultText
+        let cut = text.IndexOf(" • ")
+        if cut > 0 then text.Substring(0, cut) else text
+
+    /// Whether anything is folded behind the headline. A one-line message - an
+    /// error, usually - gets no button, because there is nothing to unfold.
+    member this.HasInstallResultDetails =
+        let text = if isNull installResultText then "" else installResultText
+        text.Contains(" • ")
+
+    member this.IsInstallResultExpanded = isInstallResultExpanded
+
+    member this.InstallResultToggleText =
+        if isInstallResultExpanded then "HIDE" else "DETAILS"
+
+    member this.ToggleInstallResult() =
+        isInstallResultExpanded <- not isInstallResultExpanded
+        this.RaisePropertyChanged("IsInstallResultExpanded")
+        this.RaisePropertyChanged("InstallResultToggleText")
 
     member this.InstallResultIsError
         with get () = installResultIsError
@@ -1908,6 +3034,11 @@ type MainViewModel() as this =
         installedMfgUnlock <- mfgUnlock
         installedMultipass <- multipass
 
+        installedDeepFried <-
+            match manageCard with
+            | Some card -> ModInstaller.installedDeepFried card.Game
+            | None -> false
+
         if not (String.IsNullOrWhiteSpace(analysis.ExecutablePath)) then
             manageExePath <- analysis.ExecutablePath
             manageFolder <- analysis.ExecutableFolder
@@ -1928,6 +3059,11 @@ type MainViewModel() as this =
         this.RaiseManageInfo()
         this.RaiseDlss5State()
 
+        // Last, once the route is known: an emulator's card depends on it, and
+        // read before it (as it was) an install left the card hidden until
+        // the sheet was opened again.
+        this.RefreshDllNames()
+
         // The deep scan may have corrected the executable, so re-read what the
         // game is from the file we now believe in. Emulators have one route.
         if not isEmulatorTarget && not isAmdMode then this.DetectTarget(true)
@@ -1937,6 +3073,12 @@ type MainViewModel() as this =
         match manageCard with
         | None -> ()
         | Some card ->
+            // The DLL names are kept between openings; a rescan reads them
+            // from the disk again (a game update may have added a DLL).
+            ModInstaller.forgetProxyNames card.Game
+            // The rescan button asks about the anti-cheat again as well: a
+            // game can have gained one in an update since the sheet opened.
+            this.CheckAntiCheat(card)
             this.IsAnalyzing <- true
             manageReShadeText <- "Checking..."
             manageDlssText <- "Checking..."
@@ -1954,7 +3096,24 @@ type MainViewModel() as this =
             |> ignore
 
     member this.OpenManage(card: GameCardViewModel) =
+        // The community panel belongs to the game that is open, and to no
+        // other: folded away, and empty until this game is asked about (user:
+        // "I open A, press show, go to B and find it already open with A's
+        // numbers").
+        this.ResetCommunityGlance()
         manageCard <- Some card
+
+        // DLL NAME starts folded, with nothing left over from another game.
+        dllNamesOpen <- false
+        dllNameStatus <- ""
+        optiCustomName <- ""
+        reshadeCustomName <- ""
+        this.RefreshDllNames()
+
+        for name in
+            [ "IsDllNamesOpen"; "DllNamesIcon"; "DllNameStatus"; "HasDllNameStatus"; "OptiCustomName"
+              "ReShadeCustomName"; "CanRenameOptiCustom"; "CanRenameReShadeCustom" ] do
+            this.RaisePropertyChanged(name)
         manageAnalysis <- None
         manageTitle <- card.Title
         manageExePath <- card.ExecutablePath
@@ -1969,6 +3128,8 @@ type MainViewModel() as this =
         this.InstallProgress <- 0.0
         this.InstallStatusText <- ""
         this.IsManageOpen <- true
+        this.SetKeysStatus("")
+        this.CheckAntiCheat(card)
 
         // Preselect whichever route a managed install already used, so the
         // sheet opens on "Remove" rather than offering to switch to itself.
@@ -1981,12 +3142,24 @@ type MainViewModel() as this =
         let (mfgUnlock, multipass) = ModInstaller.installedRenoDxOptions card.Game
         installedMfgUnlock <- mfgUnlock
         installedMultipass <- multipass
+        installedDeepFried <- ModInstaller.installedDeepFried card.Game
 
         // Open on whatever the recorded install actually used, so the sheet
         // offers Remove rather than a switch to itself.
         useNeuralAddon <- installedNeural
         useMfgUnlock <- installedMfgUnlock
         useMultipass <- installedMultipass
+        useDeepFried <- installedDeepFried
+
+        // The overlay is a choice per game: one this app installed opens on
+        // what its install carried, any other on the last choice made.
+        isOverlayEnabled <-
+            match ModInstaller.installedOverlay card.Game with
+            | Some carried -> carried
+            | None -> overlayDefault
+
+        this.RaisePropertyChanged("IsOverlayEnabled")
+        this.RaisePropertyChanged("IsOverlayKeyVisible")
 
         // A fresh sheet: nothing has been picked in it yet, and whether this
         // game arrived with an install is what decides if detection may route
@@ -2009,10 +3182,30 @@ type MainViewModel() as this =
         isEmulatorTarget <- card.Game.LauncherTypeName = "EMULATOR"
         this.RaisePropertyChanged("IsEmulatorTarget")
         this.RaisePropertyChanged("IsGameTarget")
+        // The DLL NAME card depends on both the target kind and the route.
+        this.RefreshDllNames()
 
         this.RaisePropertyChanged("IsAmdRouteActive")
 
         if isEmulatorTarget then
+            // Which slot ReShade hooks. This has to sit *after* isEmulatorTarget
+            // is set above, or it reads the previous sheet's value.
+            //
+            // Only a 1.2.7+ manifest records a real choice (`EmuApi`). Before
+            // that every route stored a meaningless "dx12" in `Api`, so reading
+            // that back would flip an emulator that was actually installed on
+            // Vulkan. Empty means nobody chose, and the catalogue decides -
+            // which is precisely what the older builds did.
+            optiApi <-
+                match ModInstaller.installedEmulatorApi card.Game with
+                | "vulkan" -> ModInstaller.OptiVulkan
+                | "dx12" -> ModInstaller.OptiDx12
+                | _ ->
+                    if EmulatorCatalog.reShadeApi card.ExecutablePath = EmulatorCatalog.vulkanApi then
+                        ModInstaller.OptiVulkan
+                    else
+                        ModInstaller.OptiDx12
+
             this.ApplyInstallMode(ModInstaller.Emulator)
         elif isAmdMode then
             // AMD mode overrides detection entirely: one payload, no choices.
@@ -2047,6 +3240,38 @@ type MainViewModel() as this =
         | None ->
             this.RaiseManageInfo()
             this.AnalyzeManageTarget()
+
+    // ---- Anti-cheat --------------------------------------------------------
+    /// The yellow mark beside the game's name in the Manage sheet.
+    member this.HasAntiCheat = manageAntiCheat.IsSome
+
+    member this.AntiCheatText =
+        match manageAntiCheat with
+        | None -> ""
+        | Some "" -> loc.AntiCheatWarning.Replace(" ({name})", "").Replace("({name})", "")
+        | Some name -> loc.AntiCheatWarning.Replace("{name}", name)
+
+    /// Off the UI thread: it walks the game's folder. The answer is kept only
+    /// if the sheet still shows the same game when it arrives.
+    member private this.CheckAntiCheat(card: GameCardViewModel) =
+        manageAntiCheat <- None
+        this.RaisePropertyChanged("HasAntiCheat")
+        this.RaisePropertyChanged("AntiCheatText")
+        let title = card.Title
+        let folder = card.InstallDirectory
+        let exe = card.ExecutablePath
+
+        System.Threading.Tasks.Task.Run(fun () ->
+            let found = try AntiCheat.detect title folder exe with _ -> None
+
+            Dispatcher.UIThread.Post(fun () ->
+                match manageCard with
+                | Some current when obj.ReferenceEquals(current, card) ->
+                    manageAntiCheat <- found
+                    this.RaisePropertyChanged("HasAntiCheat")
+                    this.RaisePropertyChanged("AntiCheatText")
+                | _ -> ()))
+        |> ignore
 
     member this.CloseManage() =
         if not isInstalling then
@@ -2083,6 +3308,7 @@ type MainViewModel() as this =
             let targetNeural = useNeuralAddon
             let targetMfgUnlock = useMfgUnlock
             let targetMultipass = useMultipass
+            let targetDeepFried = useDeepFried
             let targetOverlay = this.OverlayOptions
 
             this.InstallResultText <- ""
@@ -2116,7 +3342,7 @@ type MainViewModel() as this =
                             (false, "Could not remove the previous install: " + removal.Message)
                         else
                             let outcome =
-                                ModInstaller.install game exePath plan target targetArch targetApi targetNeural targetMfgUnlock targetMultipass targetOverlay (scaled 0.33 0.67)
+                                ModInstaller.install game exePath plan target targetArch targetApi targetNeural targetMfgUnlock targetMultipass targetDeepFried targetOverlay (scaled 0.33 0.67)
                             (outcome.Success, "Switched. " + outcome.Message)
                     with ex ->
                         (false, ex.Message)
@@ -2125,7 +3351,9 @@ type MainViewModel() as this =
                     this.IsInstalling <- false
 
                     // A switch ends with the new route installed: the install chime.
-                    if succeeded then UiSounds.installDone ()
+                    if succeeded then
+                        UiSounds.installDone ()
+                        this.ApplyKeysToInstall()
                     this.InstallResultIsError <- not succeeded
                     this.InstallResultText <- message
                     this.InstallProgress <- (if succeeded then 100.0 else 0.0)
@@ -2171,7 +3399,7 @@ type MainViewModel() as this =
                     try
                         let outcome =
                             if isInstallAction then
-                                ModInstaller.install game exePath plan installMode installArch optiApi useNeuralAddon useMfgUnlock useMultipass this.OverlayOptions report
+                                ModInstaller.install game exePath plan installMode installArch optiApi useNeuralAddon useMfgUnlock useMultipass useDeepFried this.OverlayOptions report
                             else
                                 ModInstaller.uninstall game exePath plan report
 
@@ -2185,7 +3413,11 @@ type MainViewModel() as this =
                     // A calm chime for a finished install, the same notes falling
                     // for a removal. Nothing on a failure.
                     if succeeded then
-                        if isInstallAction then UiSounds.installDone () else UiSounds.uninstallDone ()
+                        if isInstallAction then
+                            UiSounds.installDone ()
+                            this.ApplyKeysToInstall()
+                        else
+                            UiSounds.uninstallDone ()
                     this.InstallResultIsError <- not succeeded
                     this.InstallResultText <- message
                     this.InstallProgress <- (if succeeded then 100.0 else 0.0)
@@ -2229,8 +3461,25 @@ type MainViewModel() as this =
     member this.TutorialsUrl = "https://www.youtube.com/@Nodix-Tech"
 
     // Authorship & rights, shown in the About card.
-    member this.CreditsText = "Built by NODIX TECH · Published by Numidia Studios"
-    member this.CopyrightText = sprintf "© %d Numidia Studios. All rights reserved." DateTime.Now.Year
+    member this.CreditsText = "Built by NODIX TECH"
+    member this.CopyrightText = sprintf "© %d NODIX TECH. All rights reserved." DateTime.Now.Year
+
+    // ---------------------------------------------------------------------
+    // THIS MACHINE
+    // ---------------------------------------------------------------------
+    /// The card the app found, shown in the About card so the user can see for
+    /// themselves what the install routes are reading. One cached registry
+    /// read, so binding to it is free after the first.
+    member this.DetectedGpuText =
+        let name = SystemSpecs.gpuName ()
+        if String.IsNullOrWhiteSpace(name) then "Not detected" else name
+
+    member this.HasDetectedGpu = not (String.IsNullOrWhiteSpace(SystemSpecs.gpuName ()))
+
+    /// An RTX 40 installs its own OptiScaler build, chosen by the card rather
+    /// than by a switch - so the badge beside the name is the only place that
+    /// tells the user it is happening.
+    member this.IsRtx40Gpu = SystemSpecs.isRtx40 ()
 
     member this.IsCheckingUpdates
         with get () = isCheckingUpdates
@@ -2547,14 +3796,44 @@ type MainViewModel() as this =
                         try System.IO.File.Delete(stale) with _ -> ()
 
                 System.IO.File.Copy(sourcePath, target, true)
-                card.SetBanner(target)
 
-                GameScanner.saveGamesToCache [ for c in allGames -> c.Game ]
+                // The pick is the file, not a field in the game record: a scan
+                // rebuilds every record from disk, and a pick stored there was
+                // lost the next time the library was scanned.
+                card.RefreshBanner()
+                this.RaisePropertyChanged("CanRestoreCover")
             with _ ->
                 ()
 
+    /// Whether the game whose sheet is open is wearing a picture its owner
+    /// chose - which is the only time there is anything to put back.
+    member _.CanRestoreCover =
+        match manageCard with
+        | Some card -> card.HasCustomCover
+        | None -> false
+
+    /// Back to the artwork the scan found for this game. Does nothing when
+    /// there was no pick, which is what the menu item does on a card nobody
+    /// has changed.
+    member this.RestoreGameCover(card: GameCardViewModel) =
+        if not (isNull (box card)) && GameScanner.clearCustomCover card.Game then
+            card.RefreshBanner()
+            this.RaisePropertyChanged("CanRestoreCover")
+
     /// Right-click on a card: drop the title from the library without touching
     /// anything on disk. Its cached analysis goes with it.
+    ///
+    /// `alsoExclude` additionally records it, so the next scan does not simply
+    /// find the same folder and put it back. Adding it by hand still works.
+    member this.RemoveGame(card: GameCardViewModel, alsoExclude: bool) =
+        if not (isNull (box card)) && alsoExclude then
+            try
+                GameScanner.addExcluded card.Game.TargetExecutablePath card.Game.Title
+            with _ ->
+                ()
+
+        this.RemoveGame(card)
+
     member this.RemoveGame(card: GameCardViewModel) =
         if not (isNull (box card)) then
             if isManageOpen && (match manageCard with Some c -> Object.ReferenceEquals(c, card) | None -> false) then
@@ -2633,6 +3912,19 @@ type MainViewModel() as this =
     /// The neural upstream build of OptiScaler, swapped the same way and just
     /// as unswitchable - the neural API has nothing to install without it.
     member this.OptiScalerNeuralState = ModInstaller.Payload.describeOptiScalerNeural ()
+
+    /// The RTX 40 build, swapped and restored exactly like the one above.
+    member this.OptiScalerRtx40State = ModInstaller.Payload.describeOptiScalerRtx40 ()
+
+    member this.ReplaceOptiScalerRtx40(sourceDir: string) =
+        let (ok, message) = ModInstaller.Payload.replaceOptiScalerRtx40 sourceDir
+        this.PayloadStatusText <- message
+        if ok then this.RaisePropertyChanged("OptiScalerRtx40State")
+
+    member this.RestoreOptiScalerRtx40() =
+        let (ok, message) = ModInstaller.Payload.restoreOptiScalerRtx40 ()
+        this.PayloadStatusText <- message
+        if ok then this.RaisePropertyChanged("OptiScalerRtx40State")
 
     member this.ReplaceReShadeSetup(sourcePath: string) =
         let (ok, message) = ModInstaller.Payload.replaceReShade sourcePath

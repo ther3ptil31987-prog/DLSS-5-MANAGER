@@ -1,4 +1,4 @@
-namespace DLSS_5_MANAGER.Services
+﻿namespace DLSS_5_MANAGER.Services
 
 open System
 open System.IO
@@ -106,8 +106,35 @@ module GameScanner =
 
         list |> Seq.distinct |> Seq.toList
 
+    /// What a search result's name is checked against: the title with the
+    /// store tags and version junk taken off - the first query - rather than
+    /// any of the shortened ones, which only exist to widen the search.
+    let private wantedName (gameTitle: string) (queries: string list) =
+        match queries with
+        | first :: _ -> first
+        | [] -> gameTitle
+
+    let private isDlcName (name: string) =
+        name.Contains("Pack", StringComparison.OrdinalIgnoreCase)
+        || name.Contains("DLC", StringComparison.OrdinalIgnoreCase)
+        || name.Contains("Soundtrack", StringComparison.OrdinalIgnoreCase)
+        || name.Contains("Season Pass", StringComparison.OrdinalIgnoreCase)
+
+    /// Steam's poster for a title, through the storefront search.
+    ///
+    /// Every result is checked by name before its poster is used - the same
+    /// test SteamCovers applies. It used to take the first result that was not
+    /// a DLC, for every query down to the title's first two words, and the
+    /// search ranks by popularity rather than by name: "Red Dead" answers with
+    /// whichever Red Dead is selling best. That is how a card got another
+    /// game's cover, and why it could change from one scan to the next. Now a
+    /// result has to be this game, a sequel's number has to agree, and nothing
+    /// close enough means the next source - or the game's own icon - rather
+    /// than a guess.
     let private searchSteamPosterByTitle (gameTitle: string) : string =
         let queries = generateSearchQueries gameTitle
+        let wanted = wantedName gameTitle queries
+        let tried = HashSet<string>()
         let mutable foundPoster = ""
 
         let searchSingleQuery (query: string) =
@@ -119,43 +146,34 @@ module GameScanner =
                     let task = httpClient.GetStringAsync(url)
                     let json = task.GetAwaiter().GetResult()
                     using (JsonDocument.Parse(json)) (fun doc ->
-                        let root = doc.RootElement
-                        let mutable candidatePoster = ""
-                        match root.TryGetProperty("items") with
+                        match doc.RootElement.TryGetProperty("items") with
                         | true, items when items.ValueKind = JsonValueKind.Array ->
-                            let count = items.GetArrayLength()
-                            // Pass 1: Try base games only (filter out DLCs/Packs/Soundtracks)
-                            for i in 0 .. (min 10 (count - 1)) do
-                                if String.IsNullOrWhiteSpace(candidatePoster) then
-                                    let item = items.[i]
-                                    let itemName = tryGetJsonString item "name"
-                                    let isDlc = itemName.Contains("Pack", StringComparison.OrdinalIgnoreCase) || 
-                                                itemName.Contains("DLC", StringComparison.OrdinalIgnoreCase) || 
-                                                itemName.Contains("Soundtrack", StringComparison.OrdinalIgnoreCase) ||
-                                                itemName.Contains("Season Pass", StringComparison.OrdinalIgnoreCase)
-                                    if not isDlc then
-                                        match item.TryGetProperty("id") with
-                                        | true, idProp when idProp.ValueKind = JsonValueKind.Number ->
-                                            let id = string (idProp.GetInt32())
-                                            let p = fetchSteamPoster id
-                                            if not (String.IsNullOrWhiteSpace(p)) then
-                                                candidatePoster <- p
-                                        | _ -> ()
-                            
-                            // Pass 2: If no base game matched, try any item
-                            if String.IsNullOrWhiteSpace(candidatePoster) then
-                                for i in 0 .. (min 5 (count - 1)) do
-                                    if String.IsNullOrWhiteSpace(candidatePoster) then
-                                        let item = items.[i]
-                                        match item.TryGetProperty("id") with
-                                        | true, idProp when idProp.ValueKind = JsonValueKind.Number ->
-                                            let id = string (idProp.GetInt32())
-                                            let p = fetchSteamPoster id
-                                            if not (String.IsNullOrWhiteSpace(p)) then
-                                                candidatePoster <- p
-                                        | _ -> ()
-                        | _ -> ()
-                        candidatePoster
+                            // Base games before DLC, then the closest name first.
+                            let candidates =
+                                items.EnumerateArray()
+                                |> Seq.choose (fun item ->
+                                    let name = tryGetJsonString item "name"
+
+                                    match item.TryGetProperty("id") with
+                                    | true, idProp when idProp.ValueKind = JsonValueKind.Number ->
+                                        let sure = SteamCovers.score wanted name
+                                        if sure >= 50 then Some(string (idProp.GetInt32()), sure, isDlcName name) else None
+                                    | _ -> None)
+                                |> Seq.sortBy (fun (_, sure, dlc) -> (dlc, -sure))
+                                |> Seq.toList
+
+                            // One game is asked for once, however many of the
+                            // queries turn it up.
+                            candidates
+                            |> List.tryPick (fun (id, _, _) ->
+                                if tried.Add(id) then
+                                    match fetchSteamPoster id with
+                                    | "" -> None
+                                    | poster -> Some poster
+                                else
+                                    None)
+                            |> Option.defaultValue ""
+                        | _ -> ""
                     )
             with _ -> ""
 
@@ -167,8 +185,13 @@ module GameScanner =
 
         foundPoster
 
+    /// GOG's poster for a title, checked by name the same way. The file is
+    /// named after GOG's product id: it used to be named after the query's
+    /// GetHashCode, which .NET randomises on every start, so the cache never
+    /// hit - and a later run could land on a file another query had written.
     let private searchGogPosterByTitle (gameTitle: string) : string =
         let queries = generateSearchQueries gameTitle
+        let wanted = wantedName gameTitle queries
         let mutable foundPoster = ""
 
         let searchSingleQuery (query: string) =
@@ -180,24 +203,30 @@ module GameScanner =
                     let task = httpClient.GetStringAsync(url)
                     let json = task.GetAwaiter().GetResult()
                     using (JsonDocument.Parse(json)) (fun doc ->
-                        let root = doc.RootElement
-                        let mutable candidatePoster = ""
-                        match root.TryGetProperty("products") with
-                        | true, products when products.ValueKind = JsonValueKind.Array && products.GetArrayLength() > 0 ->
-                            let count = products.GetArrayLength()
-                            for i in 0 .. (min 3 (count - 1)) do
-                                if String.IsNullOrWhiteSpace(candidatePoster) then
-                                    let prod = products.[i]
-                                    let img = tryGetJsonString prod "image"
-                                    if not (String.IsNullOrWhiteSpace(img)) then
-                                        let imgUrl = 
-                                            let cleanImg = if img.StartsWith("//") then "https:" + img else img
-                                            sprintf "%s_vertical_480.jpg" cleanImg
-                                        let p = downloadPoster imgUrl (sprintf "gog_%s.jpg" (Math.Abs(query.GetHashCode()).ToString()))
-                                        if not (String.IsNullOrWhiteSpace(p)) && isVerticalPoster p then
-                                            candidatePoster <- p
-                        | _ -> ()
-                        candidatePoster
+                        match doc.RootElement.TryGetProperty("products") with
+                        | true, products when products.ValueKind = JsonValueKind.Array ->
+                            products.EnumerateArray()
+                            |> Seq.choose (fun prod ->
+                                let title = tryGetJsonString prod "title"
+                                let img = tryGetJsonString prod "image"
+
+                                let id =
+                                    match prod.TryGetProperty("id") with
+                                    | true, v when v.ValueKind = JsonValueKind.Number -> string (v.GetInt64())
+                                    | _ -> ""
+
+                                let sure = SteamCovers.score wanted title
+
+                                if sure >= 50 && id <> "" && not (String.IsNullOrWhiteSpace(img)) then Some(id, img, sure)
+                                else None)
+                            |> Seq.sortByDescending (fun (_, _, sure) -> sure)
+                            |> Seq.truncate 3
+                            |> Seq.tryPick (fun (id, img, _) ->
+                                let cleanImg = if img.StartsWith("//") then "https:" + img else img
+                                let p = downloadPoster (sprintf "%s_vertical_480.jpg" cleanImg) (sprintf "gog_%s.jpg" id)
+                                if not (String.IsNullOrWhiteSpace(p)) && isVerticalPoster p then Some p else None)
+                            |> Option.defaultValue ""
+                        | _ -> ""
                     )
             with _ -> ""
 
@@ -723,6 +752,55 @@ module GameScanner =
             else []
         with _ -> []
 
+    /// The cover a person picked for this game, if there is one.
+    ///
+    /// It lives beside the cache as `custom_<key>.<ext>` and is deliberately
+    /// NOT written into the game record: a scan rebuilds every record from
+    /// what is on disk, so a pick stored there was lost on the next scan (user:
+    /// "re-scanning deletes the pictures people chose"). Stored as a file and
+    /// asked for when the card draws, it survives anything the scanner does.
+    let customCoverKey (game: GameItem) =
+        let raw = if String.IsNullOrWhiteSpace(game.AppId) then game.Title else game.AppId
+        Text.RegularExpressions.Regex.Replace(raw, @"[^A-Za-z0-9_\-]", "_")
+
+    let posterFolder () =
+        Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "DLSS5Manager",
+            "Cache",
+            "Posters"
+        )
+
+    let customCoverPath (game: GameItem) : string option =
+        try
+            let folder = posterFolder ()
+
+            if not (Directory.Exists(folder)) then
+                None
+            else
+                Directory.GetFiles(folder, "custom_" + customCoverKey game + ".*")
+                |> Array.sortBy (fun f -> f.Length)
+                |> Array.tryHead
+        with _ ->
+            None
+
+    /// Takes the pick off again, leaving the artwork the scan found.
+    let clearCustomCover (game: GameItem) : bool =
+        try
+            let folder = posterFolder ()
+
+            if not (Directory.Exists(folder)) then
+                false
+            else
+                let files = Directory.GetFiles(folder, "custom_" + customCoverKey game + ".*")
+
+                for file in files do
+                    try File.Delete(file) with _ -> ()
+
+                files.Length > 0
+        with _ ->
+            false
+
     let saveGamesToCache (games: GameItem list) : unit =
         try
             let cachePath = getCacheFilePath ()
@@ -737,6 +815,108 @@ module GameScanner =
             let cachePath = getCacheFilePath ()
             if File.Exists(cachePath) then File.Delete(cachePath)
         with _ -> ()
+
+    // =========================================================================
+    // EXCLUSIONS - titles a scan must not bring back
+    // =========================================================================
+    //
+    // Removing a game only took it off the screen: the next scan found the same
+    // folder and put it straight back. This is the list of executables the user
+    // has said they do not want, and a scan skips them. Adding the game by hand
+    // afterwards still works - that path never consults this list.
+    //
+    // Kept as its own small file rather than a field in settings.json, because
+    // every writer of that record builds it whole and a new field would have to
+    // be threaded through all of them.
+
+    let private getExclusionPath () =
+        let localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData)
+        let dir = Path.Combine(localAppData, "DLSS5Manager")
+        if not (Directory.Exists(dir)) then Directory.CreateDirectory(dir) |> ignore
+        Path.Combine(dir, "excluded.json")
+
+    /// Paths are matched case-insensitively: Windows does, and the same game
+    /// reached through two spellings is one game.
+    let loadExcluded () : HashSet<string> =
+        try
+            let p = getExclusionPath ()
+
+            if File.Exists(p) then
+                let options = JsonSerializerOptions()
+                options.PropertyNameCaseInsensitive <- true
+                let list = JsonSerializer.Deserialize<string list>(File.ReadAllText(p), options)
+                HashSet<string>((if isNull (box list) then [] else list), StringComparer.OrdinalIgnoreCase)
+            else
+                HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        with _ ->
+            HashSet<string>(StringComparer.OrdinalIgnoreCase)
+
+    let private saveExcluded (set: HashSet<string>) : unit =
+        try
+            let options = JsonSerializerOptions()
+            options.WriteIndented <- true
+            File.WriteAllText(getExclusionPath (), JsonSerializer.Serialize(set |> Seq.toList, options))
+        with _ ->
+            ()
+
+    /// Both are recorded: the executable is what a scan actually finds, and the
+    /// title catches the same game arriving from a different launcher.
+    let addExcluded (exePath: string) (title: string) : unit =
+        let set = loadExcluded ()
+
+        if not (String.IsNullOrWhiteSpace(exePath)) then set.Add(exePath.Trim()) |> ignore
+        if not (String.IsNullOrWhiteSpace(title)) then set.Add(title.Trim()) |> ignore
+
+        saveExcluded set
+
+    let isExcluded (set: HashSet<string>) (game: GameItem) : bool =
+        (not (String.IsNullOrWhiteSpace(game.TargetExecutablePath))
+         && set.Contains(game.TargetExecutablePath.Trim()))
+        || (not (String.IsNullOrWhiteSpace(game.Title)) && set.Contains(game.Title.Trim()))
+
+    // =========================================================================
+    // AUTO-SCAN ON LAUNCH
+    // =========================================================================
+    //
+    // A huge library can take minutes to walk, and someone whose library never
+    // changes should not pay that on every launch. The scan therefore waits a
+    // few seconds before it starts, and this is the switch that says whether it
+    // starts at all.
+    //
+    // Stored as "disabled" rather than "enabled" on purpose: a machine with no
+    // such file reads back `false`, which has to mean the scan still runs.
+
+    let private getAutoScanPath () =
+        let localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData)
+        let dir = Path.Combine(localAppData, "DLSS5Manager")
+        if not (Directory.Exists(dir)) then Directory.CreateDirectory(dir) |> ignore
+        Path.Combine(dir, "autoscan_off.txt")
+
+    // The file holds the app version the scan was turned down in. Turned down
+    // once, it stays down: users reported that "not now" followed by a restart
+    // started the very scan they had just refused - an empty library asks on
+    // every launch. An update is the one thing that asks again, because a new
+    // build may detect games the old one could not. A file from an older build
+    // ("1") names no version, so it counts as turned down in an older one.
+
+    /// The version the automatic scan was turned down in, "" if it never was.
+    let autoScanRefusedIn () : string =
+        try
+            let p = getAutoScanPath ()
+            if File.Exists(p) then File.ReadAllText(p).Trim() else ""
+        with _ -> ""
+
+    /// Turned down in this very version: nothing starts until the user asks.
+    let isAutoScanDisabled (version: string) : bool =
+        autoScanRefusedIn () = version
+
+    let setAutoScanDisabled (disabled: bool) (version: string) : unit =
+        try
+            let p = getAutoScanPath ()
+            if disabled then File.WriteAllText(p, version)
+            elif File.Exists(p) then File.Delete(p)
+        with _ ->
+            ()
 
     // -------------------------------------------------------------------------
     // EMULATORS
@@ -834,7 +1014,7 @@ module GameScanner =
 
     let private defaultSettings () =
         { IsSidebarLayout = false
-          ColorAtmosphere = "Neon Emerald"
+          ColorAtmosphere = "Emerald Horizon"
           GeometricMotif = "Orbital Spheres"
           Language = Localization.systemLanguage ()
           SupportPromptVersion = ""
@@ -852,7 +1032,7 @@ module GameScanner =
                 let options = JsonSerializerOptions()
                 options.PropertyNameCaseInsensitive <- true
                 let s = JsonSerializer.Deserialize<AppSettings>(json, options)
-                let color = if String.IsNullOrWhiteSpace(s.ColorAtmosphere) then "Neon Emerald" else s.ColorAtmosphere
+                let color = if String.IsNullOrWhiteSpace(s.ColorAtmosphere) then "Emerald Horizon" else s.ColorAtmosphere
                 let motif = if String.IsNullOrWhiteSpace(s.GeometricMotif) then "Orbital Spheres" else s.GeometricMotif
                 let lang = if String.IsNullOrWhiteSpace(s.Language) then Localization.systemLanguage () else s.Language
                 // A settings file written before the overlay existed has no
